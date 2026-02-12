@@ -26,12 +26,19 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "esp_wifi.h"
+#include <TinyGPS++.h>
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
 
 #define BUZZER_PIN 3
+
+// Hardware GPS (Seeed L76K GNSS module)
+#define GPS_RX_PIN 44      // D7 — ESP32 RX <- GPS TX
+#define GPS_TX_PIN 43      // D6 — ESP32 TX -> GPS RX
+#define GPS_BAUD   9600
+#define GPS_HDOP_SCALE 5.0f  // HDOP * scale ≈ accuracy in meters
 
 // Audio
 #define LOW_FREQ 200
@@ -150,6 +157,16 @@ static float  fyGPSAcc = 0;
 static bool   fyGPSValid = false;
 static unsigned long fyGPSLastUpdate = 0;
 #define GPS_STALE_MS 30000  // GPS considered stale after 30s without update
+
+// Hardware GPS state (Seeed L76K GNSS module on UART1)
+static TinyGPSPlus fyGPS;
+static HardwareSerial fyGPSSerial(1);
+static bool fyHWGPSDetected = false;     // Any NMEA received = module present
+static bool fyHWGPSFix = false;          // Valid position fix
+static int  fyHWGPSSats = 0;             // Satellite count
+static unsigned long fyHWGPSLastChar = 0;
+static bool fyGPSIsHardware = false;     // Current GPS source is hardware
+#define GPS_HW_TIMEOUT_MS 5000
 
 // Session persistence (SPIFFS)
 #define FY_SESSION_FILE  "/session.json"
@@ -310,6 +327,57 @@ static void fyAttachGPS(FYDetection& d) {
         d.gpsLat = fyGPSLat;
         d.gpsLon = fyGPSLon;
         d.gpsAcc = fyGPSAcc;
+    }
+}
+
+// ============================================================================
+// HARDWARE GPS PROCESSING
+// ============================================================================
+
+static void fyProcessHardwareGPS() {
+    // Read all available UART bytes into TinyGPSPlus parser
+    while (fyGPSSerial.available()) {
+        char c = fyGPSSerial.read();
+        fyGPS.encode(c);
+        fyHWGPSLastChar = millis();
+        if (!fyHWGPSDetected) {
+            fyHWGPSDetected = true;
+            printf("[FLOCK-YOU] Hardware GPS module detected (NMEA data received)\n");
+        }
+    }
+
+    // Timeout: no NMEA data for 5s → module disconnected or absent
+    if (fyHWGPSDetected && (millis() - fyHWGPSLastChar > GPS_HW_TIMEOUT_MS)) {
+        if (fyGPSIsHardware) {
+            printf("[FLOCK-YOU] Hardware GPS timeout — falling back to phone GPS\n");
+        }
+        fyHWGPSDetected = false;
+        fyHWGPSFix = false;
+        fyHWGPSSats = 0;
+        fyGPSIsHardware = false;
+    }
+
+    // Update satellite count whenever available
+    if (fyGPS.satellites.isUpdated()) {
+        fyHWGPSSats = fyGPS.satellites.value();
+    }
+
+    // Update position when valid fix is available
+    if (fyGPS.location.isUpdated() && fyGPS.location.isValid()) {
+        if (!fyHWGPSFix) {
+            printf("[FLOCK-YOU] First GPS fix acquired! Sats:%d Lat:%.6f Lon:%.6f\n",
+                   fyHWGPSSats, fyGPS.location.lat(), fyGPS.location.lng());
+        }
+        fyHWGPSFix = true;
+        fyGPSIsHardware = true;
+        fyGPSLat = fyGPS.location.lat();
+        fyGPSLon = fyGPS.location.lng();
+        fyGPSAcc = fyGPS.hdop.isValid() ? (float)(fyGPS.hdop.hdop() * GPS_HDOP_SCALE) : 10.0f;
+        fyGPSValid = true;
+        fyGPSLastUpdate = millis();
+    } else if (fyHWGPSFix && fyGPS.location.isValid()) {
+        // Keep updating timestamp while fix is held
+        fyGPSLastUpdate = millis();
     }
 }
 
@@ -655,7 +723,7 @@ h4{color:#ec4899;font-size:14px;margin-bottom:8px}
 <div class="sc"><div class="n" id="sT">0</div><div class="l">DETECTED</div></div>
 <div class="sc"><div class="n" id="sR">0</div><div class="l">RAVEN</div></div>
 <div class="sc"><div class="n" id="sB">ON</div><div class="l">BLE</div></div>
-<div class="sc" onclick="reqGPS()" style="cursor:pointer"><div class="n" id="sG" style="font-size:14px">TAP</div><div class="l">GPS</div></div>
+<div class="sc" onclick="reqGPS()" style="cursor:pointer"><div class="n" id="sG" style="font-size:14px">TAP</div><div class="l" id="sGL">GPS</div></div>
 </div>
 <div class="tb">
 <button class="a" onclick="tab(0,this)">LIVE</button>
@@ -690,7 +758,7 @@ function refresh(){fetch('/api/detections').then(r=>r.json()).then(d=>{D=d;rende
 function render(){const el=document.getElementById('dL');if(!D.length){el.innerHTML='<div class="empty">Scanning for surveillance devices...<br>BLE active on all channels</div>';return;}
 D.sort((a,b)=>b.last-a.last);el.innerHTML=D.map(card).join('');}
 function stats(){document.getElementById('sT').textContent=D.length;document.getElementById('sR').textContent=D.filter(d=>d.raven).length;
-fetch('/api/stats').then(r=>r.json()).then(s=>{let g=document.getElementById('sG');if(s.gps_valid){g.textContent=s.gps_tagged+'/'+s.total;g.style.color='#22c55e';}else{g.textContent='OFF';g.style.color='#ef4444';}}).catch(()=>{});}
+fetch('/api/stats').then(r=>r.json()).then(s=>{let g=document.getElementById('sG'),gl=document.getElementById('sGL');if(s.gps_src==='hw'){g.textContent=s.gps_sats+'sat';g.style.color='#22c55e';gl.textContent='HW GPS';}else if(s.gps_src==='phone'){g.textContent=s.gps_tagged+'/'+s.total;g.style.color='#22c55e';gl.textContent='PHONE';}else if(s.gps_hw_detected){g.textContent=s.gps_sats+'sat';g.style.color='#facc15';gl.textContent='NO FIX';}else{g.textContent='TAP';g.style.color='#ef4444';gl.textContent='GPS';}}).catch(()=>{});}
 function card(d){return '<div class="det"><div class="mac">'+d.mac+(d.name?'<span class="nm">'+d.name+'</span>':'')+'</div><div class="inf"><span>RSSI: '+d.rssi+'</span><span>'+d.method+'</span><span style="color:#ec4899;font-weight:bold">&times;'+d.count+'</span>'+(d.raven?'<span class="rv">RAVEN '+d.fw+'</span>':'')+(d.gps?'<span style="color:#22c55e">&#9673; '+d.gps.lat.toFixed(5)+','+d.gps.lon.toFixed(5)+'</span>':'<span style="color:#666">no gps</span>')+'</div></div>';}
 function loadHistory(){fetch('/api/history').then(r=>r.json()).then(d=>{H=d;let el=document.getElementById('hL');if(!H.length){el.innerHTML='<div class="empty">No prior session data</div>';return;}
 H.sort((a,b)=>b.last-a.last);el.innerHTML='<div style="font-size:11px;color:#8b5cf6;margin-bottom:8px">'+H.length+' detections from prior session</div>'+H.map(card).join('');window._hL=1;}).catch(()=>{document.getElementById('hL').innerHTML='<div class="empty">No prior session data</div>';});}
@@ -752,25 +820,36 @@ static void fySetupServer() {
             }
             xSemaphoreGive(fyMutex);
         }
-        char buf[256];
+        const char* gpsSrc = "none";
+        if (fyGPSIsHardware && fyHWGPSFix) gpsSrc = "hw";
+        else if (fyGPSIsFresh()) gpsSrc = "phone";
+        char buf[320];
         snprintf(buf, sizeof(buf),
             "{\"total\":%d,\"raven\":%d,\"ble\":\"active\","
-            "\"gps_valid\":%s,\"gps_age\":%lu,\"gps_tagged\":%d}",
+            "\"gps_valid\":%s,\"gps_age\":%lu,\"gps_tagged\":%d,"
+            "\"gps_src\":\"%s\",\"gps_sats\":%d,\"gps_hw_detected\":%s}",
             fyDetCount, raven,
             fyGPSIsFresh() ? "true" : "false",
             fyGPSValid ? (millis() - fyGPSLastUpdate) : 0UL,
-            withGPS);
+            withGPS,
+            gpsSrc, fyHWGPSSats,
+            fyHWGPSDetected ? "true" : "false");
         r->send(200, "application/json", buf);
     });
 
-    // API: Receive GPS from phone browser
+    // API: Receive GPS from phone browser (ignored when hardware GPS has fix)
     fyServer.on("/api/gps", HTTP_GET, [](AsyncWebServerRequest *r) {
+        if (fyHWGPSFix) {
+            r->send(200, "application/json", "{\"status\":\"ignored\",\"reason\":\"hw_gps_active\"}");
+            return;
+        }
         if (r->hasParam("lat") && r->hasParam("lon")) {
             fyGPSLat = r->getParam("lat")->value().toDouble();
             fyGPSLon = r->getParam("lon")->value().toDouble();
             fyGPSAcc = r->hasParam("acc") ? r->getParam("acc")->value().toFloat() : 0;
             fyGPSValid = true;
             fyGPSLastUpdate = millis();
+            fyGPSIsHardware = false;
             r->send(200, "application/json", "{\"status\":\"ok\"}");
         } else {
             r->send(400, "application/json", "{\"error\":\"lat,lon required\"}");
@@ -959,6 +1038,9 @@ void setup() {
 
     fyMutex = xSemaphoreCreateMutex();
 
+    // Init hardware GPS UART (Seeed L76K on D6/D7)
+    fyGPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+
     // Init SPIFFS for session persistence
     if (SPIFFS.begin(true)) {
         fySpiffsReady = true;
@@ -972,6 +1054,7 @@ void setup() {
     printf("\n========================================\n");
     printf("  FLOCK-YOU Surveillance Detector\n");
     printf("  Buzzer: %s\n", fyBuzzerOn ? "ON" : "OFF");
+    printf("  GPS: auto-detect (L76K on D6/D7)\n");
     printf("========================================\n");
 
     // Init BLE scanner FIRST -- start scanning immediately
@@ -1006,6 +1089,8 @@ void setup() {
 }
 
 void loop() {
+    fyProcessHardwareGPS();
+
     // BLE scanning cycle
     if (millis() - fyLastBleScan >= BLE_SCAN_INTERVAL && !fyBLEScan->isScanning()) {
         fyBLEScan->start(BLE_SCAN_DURATION, false);

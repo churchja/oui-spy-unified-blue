@@ -23,6 +23,7 @@
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
 #include <SPIFFS.h>
+#include <TinyGPS++.h>
 #include "modes.h"
 
 // Rename setup/loop
