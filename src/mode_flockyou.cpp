@@ -24,6 +24,7 @@
 #include <ESPAsyncWebServer.h>
 #include <SPIFFS.h>
 #include <TinyGPS++.h>
+#include <Adafruit_NeoPixel.h>
 #include "modes.h"
 
 // Rename setup/loop

@@ -49,6 +49,11 @@
 #define DETECT_BEEP_DURATION 150
 #define HEARTBEAT_DURATION 100
 
+// NeoPixel
+#define FY_NEOPIXEL_PIN 4
+#define FY_NEOPIXEL_BRIGHTNESS 50
+#define FY_NEOPIXEL_DETECTION_BRIGHTNESS 200
+
 // BLE scanning
 #define BLE_SCAN_DURATION 2      // seconds per scan
 #define BLE_SCAN_INTERVAL 3000   // ms between scans
@@ -142,6 +147,9 @@ static SemaphoreHandle_t fyMutex = NULL;
 // ============================================================================
 
 static bool fyBuzzerOn = true;
+static Adafruit_NeoPixel fyPixel(1, FY_NEOPIXEL_PIN, NEO_GRB + NEO_KHZ800);
+static bool fyPixelAlertMode = false;
+static unsigned long fyPixelAlertStart = 0;
 static unsigned long fyLastBleScan = 0;
 static bool fyTriggered = false;
 static bool fyDeviceInRange = false;
@@ -231,6 +239,8 @@ static void fyBootBeep() {
 
 static void fyDetectBeep() {
     printf("[FLOCK-YOU] Detection alert!\n");
+    fyPixelAlertMode = true;
+    fyPixelAlertStart = millis();
     if (!fyBuzzerOn) return;
     // Alarm crow: two sharp ascending chirps then a caw
     fyCaw(400, 900, 100, 30);   // rising alarm chirp
@@ -246,6 +256,83 @@ static void fyHeartbeat() {
     fyCaw(500, 400, 80, 20);
     delay(120);
     fyCaw(480, 380, 80, 20);
+}
+
+// ============================================================================
+// NEOPIXEL FUNCTIONS
+// ============================================================================
+
+static uint32_t fyHsvToRgb(uint16_t h, uint8_t s, uint8_t v) {
+    uint8_t r, g, b;
+    if (s == 0) {
+        r = g = b = v;
+    } else {
+        uint8_t region = h / 43;
+        uint8_t remainder = (h - (region * 43)) * 6;
+        uint8_t p = (v * (255 - s)) >> 8;
+        uint8_t q = (v * (255 - ((s * remainder) >> 8))) >> 8;
+        uint8_t t = (v * (255 - ((s * (255 - remainder)) >> 8))) >> 8;
+        switch (region) {
+            case 0: r = v; g = t; b = p; break;
+            case 1: r = q; g = v; b = p; break;
+            case 2: r = p; g = v; b = t; break;
+            case 3: r = p; g = q; b = v; break;
+            case 4: r = t; g = p; b = v; break;
+            default: r = v; g = p; b = q; break;
+        }
+    }
+    return fyPixel.Color(r, g, b);
+}
+
+// Idle: slow purple breathing (hue 270)
+static void fyPixelBreathing() {
+    static unsigned long lastUpdate = 0;
+    static float brightness = 0.0;
+    static bool increasing = true;
+    if (millis() - lastUpdate < 20) return;
+    lastUpdate = millis();
+    if (increasing) {
+        brightness += 0.02;
+        if (brightness >= 1.0) { brightness = 1.0; increasing = false; }
+    } else {
+        brightness -= 0.02;
+        if (brightness <= 0.1) { brightness = 0.1; increasing = true; }
+    }
+    uint32_t color = fyHsvToRgb(270, 255, (uint8_t)(FY_NEOPIXEL_BRIGHTNESS * brightness));
+    fyPixel.setPixelColor(0, color);
+    fyPixel.show();
+}
+
+// Detection: 3 rapid flashes red->pink->red (~750ms total)
+static void fyPixelDetection() {
+    unsigned long elapsed = millis() - fyPixelAlertStart;
+    int flashIdx = elapsed / 250;
+    if (flashIdx >= 3) {
+        fyPixelAlertMode = false;
+        return;
+    }
+    uint16_t hue = (flashIdx == 1) ? 300 : 0; // pink middle, red bookends
+    bool bright = ((elapsed % 250) < 150);
+    uint8_t val = bright ? FY_NEOPIXEL_DETECTION_BRIGHTNESS : (FY_NEOPIXEL_BRIGHTNESS / 4);
+    fyPixel.setPixelColor(0, fyHsvToRgb(hue, 255, val));
+    fyPixel.show();
+}
+
+// Device in range: dim steady pink glow (hue 300)
+static void fyPixelHeartbeat() {
+    fyPixel.setPixelColor(0, fyHsvToRgb(300, 255, 30));
+    fyPixel.show();
+}
+
+// Dispatcher: called each loop iteration
+static void fyUpdatePixel() {
+    if (fyPixelAlertMode) {
+        fyPixelDetection();
+    } else if (fyDeviceInRange) {
+        fyPixelHeartbeat();
+    } else {
+        fyPixelBreathing();
+    }
 }
 
 // ============================================================================
@@ -1036,6 +1123,21 @@ void setup() {
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
+    // Init NeoPixel
+    fyPixel.begin();
+    fyPixel.setBrightness(FY_NEOPIXEL_BRIGHTNESS);
+    fyPixel.clear();
+    fyPixel.show();
+    // Test flash: pink -> purple
+    fyPixel.setPixelColor(0, fyPixel.Color(236, 72, 153));  // pink #ec4899
+    fyPixel.show();
+    delay(500);
+    fyPixel.setPixelColor(0, fyPixel.Color(139, 92, 246));  // purple #8b5cf6
+    fyPixel.show();
+    delay(500);
+    fyPixel.clear();
+    fyPixel.show();
+
     fyMutex = xSemaphoreCreateMutex();
 
     // Init hardware GPS UART (Seeed L76K on D6/D7)
@@ -1090,6 +1192,7 @@ void setup() {
 
 void loop() {
     fyProcessHardwareGPS();
+    fyUpdatePixel();
 
     // BLE scanning cycle
     if (millis() - fyLastBleScan >= BLE_SCAN_INTERVAL && !fyBLEScan->isScanning()) {
