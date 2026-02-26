@@ -234,21 +234,33 @@ def batch_mode(firmware, do_erase=False):
     success_count = 0
     fail_count = 0
 
+    last_port = None
     while True:
-        board_num += 1
+        # Wait for a board to appear (that isn't the one we just flashed)
+        port = None
+        print(f"\n  Waiting for board #{board_num + 1}...", end="", flush=True)
+        start = time.time()
+        while time.time() - start < 300:
+            p = find_port()
+            if p and p != last_port:
+                port = p
+                break
+            if p is None:
+                # Previous board unplugged, reset so same port can be reused
+                last_port = None
+            time.sleep(0.5)
 
-        # Wait for a board to appear
-        port = wait_for_port(timeout=300)  # 5 min timeout
         if not port:
-            print("\n  No board detected. Still waiting? Plug one in and try again.")
+            print(" timeout.")
             try:
                 input("  Press Enter to retry, Ctrl+C to quit: ")
             except KeyboardInterrupt:
                 break
             continue
 
-        # Give the port a moment to stabilize (Windows especially needs this)
-        time.sleep(1)
+        print(f" found {port}!")
+        board_num += 1
+        time.sleep(1)  # let port stabilize
 
         ok = flash_one(port, firmware, do_erase=do_erase, board_num=board_num)
         if ok:
@@ -256,19 +268,9 @@ def batch_mode(firmware, do_erase=False):
         else:
             fail_count += 1
 
+        last_port = port
         print(f"\n  -- Score: {success_count} flashed, {fail_count} failed --")
-
-        try:
-            resp = input("\n  Swap board and press Enter for next (q to quit): ").strip().lower()
-            if resp in ("q", "quit", "exit"):
-                break
-        except (KeyboardInterrupt, EOFError):
-            break
-
-        # Wait for the old port to disappear and new one to appear
-        print("  Waiting for board swap...", end="", flush=True)
-        time.sleep(2)  # give time for USB disconnect
-        print(" ready.")
+        print(f"  Unplug board and plug in the next one...")
 
     print(f"""
   +==========================================+
@@ -284,27 +286,27 @@ def main():
     # Parse args
     args = sys.argv[1:]
     do_erase = "--erase" in args
-    do_batch = "--batch" in args
+    do_single = "--single" in args
     bin_path = None
 
     for a in args:
-        if a in ("--erase", "--batch"):
+        if a in ("--erase", "--single"):
             continue
         if a in ("-h", "--help"):
             print("""
-  Usage:  python flash.py [firmware.bin] [--erase] [--batch]
+  Usage:  python flash.py [firmware.bin] [--erase] [--single]
 
   Options:
     firmware.bin   Path to .bin file (auto-detects from firmware/ folder)
     --erase        Erase entire flash before writing
-    --batch        Batch mode: flash multiple boards one after another
+    --single       Flash one board and exit (default is auto-flash loop)
 
-  Single board:
+  Auto-flash (default -- plug boards in one after another):
     python flash.py
+    python flash.py --erase
 
-  Batch flash (production run):
-    python flash.py --batch
-    python flash.py --batch --erase
+  Single board only:
+    python flash.py --single
 
   Setup:
     pip install esptool pyserial
@@ -332,39 +334,25 @@ def main():
         print(f"  Or pass it directly:    python flash.py my_firmware.bin\n")
         sys.exit(1)
 
-    # Batch mode
-    if do_batch:
-        batch_mode(firmware, do_erase=do_erase)
+    # Single-shot mode (old behavior)
+    if do_single:
+        print(BANNER)
+        port = find_port()
+        if not port:
+            print("\n  No ESP32 detected. Is the board plugged in?")
+            print("  Make sure drivers are installed (CH340/CP210x).\n")
+            sys.exit(1)
+
+        print(f"  Found: {port}")
+
+        ok = flash_one(port, firmware, do_erase=do_erase)
+        if not ok:
+            sys.exit(1)
+        print()
         return
 
-    # Single mode — find port
-    print(BANNER)
-    port = find_port()
-    if not port:
-        print("\n  No ESP32 detected. Is the board plugged in?")
-        print("  Make sure drivers are installed (CH340/CP210x).\n")
-        sys.exit(1)
-
-    print(f"  Found: {port}")
-
-    confirm = input("\n  Flash? [Y/n]: ").strip().lower()
-    if confirm and confirm != "y":
-        print("  Aborted.")
-        sys.exit(0)
-
-    ok = flash_one(port, firmware, do_erase=do_erase)
-    if not ok:
-        sys.exit(1)
-
-    # Offer to flash another
-    try:
-        resp = input("\n  Flash another board? [y/N]: ").strip().lower()
-        if resp == "y":
-            batch_mode(firmware, do_erase=do_erase)
-    except (KeyboardInterrupt, EOFError):
-        pass
-
-    print()
+    # Default: auto-flash (batch) mode
+    batch_mode(firmware, do_erase=do_erase)
 
 
 if __name__ == "__main__":
