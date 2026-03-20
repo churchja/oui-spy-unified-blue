@@ -34,6 +34,9 @@ if sys.platform == "win32":
         sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 # -- Config ----------------------------------------------------------------
+BOOT_OFFSET   = "0x0"         # ESP32-S3 bootloader starts at 0x0
+PART_OFFSET   = "0x8000"
+OTA_OFFSET    = "0xe000"
 APP_OFFSET    = "0x10000"
 BAUD          = "921600"
 CHIP          = "esp32s3"
@@ -127,9 +130,14 @@ def find_firmware(path_arg=None):
         print(f"\n  File not found: {path_arg}")
         sys.exit(1)
 
-    # Look in firmware/ folder
+    # Look in firmware/ folder (exclude bootloader/partitions — flash_one handles those)
+    SUPPORT_BINS = {"bootloader.bin", "partitions.bin", "boot_app0.bin"}
     if os.path.isdir(FIRMWARE_DIR):
-        bins = sorted(glob.glob(os.path.join(FIRMWARE_DIR, "*.bin")), key=os.path.getmtime, reverse=True)
+        bins = sorted(
+            [b for b in glob.glob(os.path.join(FIRMWARE_DIR, "*.bin"))
+             if os.path.basename(b).lower() not in SUPPORT_BINS],
+            key=os.path.getmtime, reverse=True,
+        )
         if len(bins) == 1:
             return bins[0]
         if len(bins) > 1:
@@ -160,12 +168,20 @@ def flash_one(port, firmware, do_erase=False, board_num=None):
     """Flash a single board. Returns True on success."""
     size_kb = os.path.getsize(firmware) / 1024
     label = f"  Board #{board_num}" if board_num else "  Target"
+
+    # Look for bootloader + partitions + OTA data alongside the app binary
+    fw_dir = os.path.dirname(firmware)
+    bootloader = os.path.join(fw_dir, "bootloader.bin")
+    partitions = os.path.join(fw_dir, "partitions.bin")
+    ota_data = os.path.join(fw_dir, "boot_app0.bin")
+    has_full = os.path.isfile(bootloader) and os.path.isfile(partitions)
+
     print(f"""
 {label}
   Port:       {port}
   Firmware:   {os.path.basename(firmware)}  ({size_kb:.0f} KB)
   Chip:       {CHIP}
-  Offset:     {APP_OFFSET}
+  Full flash: {"YES (bootloader + partitions + app)" if has_full else "APP ONLY"}
   Baud:       {BAUD}
 """)
 
@@ -186,16 +202,25 @@ def flash_one(port, firmware, do_erase=False, board_num=None):
         "--flash_mode", "qio",
         "--flash_freq", "80m",
         "--flash_size", "detect",
-        APP_OFFSET, firmware,
     ]
+
+    if has_full:
+        cmd += [BOOT_OFFSET, bootloader, PART_OFFSET, partitions]
+        if os.path.isfile(ota_data):
+            cmd += [OTA_OFFSET, ota_data]
+    cmd += [APP_OFFSET, firmware]
 
     try:
         result = subprocess.run(cmd)
         if result.returncode == 0:
             print("\n  Done! Device will reboot into the new firmware.")
+            if sys.platform == "darwin":
+                subprocess.Popen(["afplay", "/System/Library/Sounds/Hero.aiff"])
             return True
         else:
             print(f"\n  esptool exited with code {result.returncode}")
+            if sys.platform == "darwin":
+                subprocess.Popen(["afplay", "/System/Library/Sounds/Basso.aiff"])
             return False
     except FileNotFoundError:
         print("  esptool not found. Install it:\n")
