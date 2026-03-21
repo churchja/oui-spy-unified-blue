@@ -128,28 +128,48 @@ On power-up, the device starts a WiFi access point (`oui-spy` / `ouispy123` by d
 
 ### Quick Flash (no PlatformIO needed)
 
-Just Python, a USB cable, and a `.bin` file.
+Just Python, a USB cable, and the `firmware/` folder. Everything you need is included in the repo.
+
+**1. Install dependencies:**
 
 ```bash
 pip install esptool pyserial
 ```
 
-Drop your compiled firmware into the `firmware/` folder, plug in the XIAO ESP32-S3, and run:
+**2. Plug in your XIAO ESP32-S3 via USB.**
+
+**3. Flash:**
 
 ```bash
 python flash.py
 ```
 
-The script auto-detects your board and flashes it. Done.
+The script auto-detects your board, confirms before flashing, and writes all four binary files in one shot:
+
+| File | Offset | Purpose |
+|------|--------|---------|
+| `bootloader.bin` | `0x0000` | ESP32-S3 bootloader |
+| `partitions.bin` | `0x8000` | Partition table |
+| `boot_app0.bin` | `0xe000` | OTA data partition |
+| `oui-spy-unified-blue.bin` | `0x10000` | Application firmware |
+
+All four files are in the `firmware/` folder. The flasher picks them up automatically. You should hear the Zelda boot sound when it finishes.
 
 **Options:**
 
 ```bash
-python flash.py                        # auto-detect bin from firmware/ folder
-python flash.py my_firmware.bin        # flash a specific file
+python flash.py                        # flash one board (default)
 python flash.py --erase                # full erase before flashing
-python flash.py my_firmware.bin --erase
+python flash.py --batch                # batch mode: flash boards one after another
+python flash.py --batch --erase        # batch + erase (production runs)
+python flash.py my_firmware.bin        # flash a specific .bin file
 ```
+
+**Troubleshooting:**
+
+- **No port detected?** Make sure drivers are installed (CH340/CP210x). On macOS, the port shows up as `/dev/cu.usbmodemXXXX`.
+- **Board doesn't boot after flash?** Make sure all four `.bin` files are in the `firmware/` folder. The script will warn you if any are missing.
+- **Multiple boards plugged in?** The script will list all detected ports and let you pick one.
 
 ### Building from Source
 
@@ -161,14 +181,21 @@ pio run -t upload           # flash directly
 pio device monitor          # serial output (115200 baud)
 ```
 
-The build output lands in `.pio/build/seeed_xiao_esp32s3/firmware.bin` — copy that into `firmware/` if you want to use the flasher script instead.
+The build output lands in `.pio/build/seeed_xiao_esp32s3/firmware.bin`. To use the flasher script instead, copy the build artifacts into `firmware/`:
+
+```bash
+cp .pio/build/seeed_xiao_esp32s3/bootloader.bin firmware/
+cp .pio/build/seeed_xiao_esp32s3/partitions.bin firmware/
+cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin firmware/
+cp .pio/build/seeed_xiao_esp32s3/firmware.bin firmware/oui-spy-unified-blue.bin
+```
 
 **Dependencies** (managed by PlatformIO):
 
-- `NimBLE-Arduino` — BLE scanning
-- `ESP Async WebServer` + `AsyncTCP` — web interfaces
-- `ArduinoJson` — JSON serialization
-- `Adafruit NeoPixel` — LED control
+- `NimBLE-Arduino` -- BLE scanning
+- `ESP Async WebServer` + `AsyncTCP` -- web interfaces
+- `ArduinoJson` -- JSON serialization
+- `Adafruit NeoPixel` -- LED control
 
 **Flash layout:** Custom partition table with ~6MB app + ~2MB LittleFS data. See `partitions.csv`.
 
