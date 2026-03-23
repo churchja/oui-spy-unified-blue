@@ -168,10 +168,15 @@ python3 flash.py
 
 ### Step 3: Verify It Worked
 
-1. On your phone or laptop, look for the WiFi network **`oui-spy`**
-2. Connect with password **`ouispy123`**
-3. Open **http://192.168.4.1** in your browser
-4. You should see the mode selector dashboard
+After a successful flash, the board reboots automatically. Here's how to confirm it's working:
+
+1. **Listen for 4 ascending beeps** -- this is the boot confirmation sound. If you hear it, the firmware is running.
+2. On your phone or laptop, look for the WiFi network **`oui-spy`**
+3. Connect with password **`ouispy123`**
+4. Open **http://192.168.4.1** in your browser
+5. You should see the mode selector dashboard
+
+> **No beeps?** The board may not have flashed correctly. Try flashing again with `python3 flash.py --erase` to do a full erase first.
 
 ### Batch Mode (Multiple Boards)
 
@@ -185,12 +190,14 @@ python3 flash.py --batch
 
 1. The script starts and waits for a board
 2. Plug in a board -- it is detected and flashed automatically
-3. When flashing finishes (you'll hear a chime on macOS), unplug the board
-4. Plug in the next board -- flashing starts automatically
+3. Wait for the board to reboot -- **listen for 4 ascending beeps**. That's your confirmation the flash was successful and the firmware is running.
+4. Unplug the board and plug in the next one -- flashing starts automatically
 5. Repeat until all boards are done
 6. Press **Ctrl+C** to stop
 
 The script never times out. It will wait as long as needed for the next board. It also tracks how many boards were flashed successfully vs. failed.
+
+> **Quick test cycle:** Plug in -> auto-flash -> hear 4 beeps -> unplug -> next board. That's it.
 
 To erase flash completely before writing (clean slate, recommended for first-time flash):
 

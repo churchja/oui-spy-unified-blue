@@ -61,10 +61,16 @@
 
   VERIFYING A FLASHED BOARD
   -------------------------
-  1. After flash, the board reboots and plays a short boot melody
+  After a successful flash, the board reboots automatically.
+
+  1. Listen for 4 ASCENDING BEEPS -- this is the boot confirmation.
+     If you hear the 4 beeps, the firmware is running correctly.
   2. A WiFi AP appears: SSID "oui-spy" / password "ouispy123"
   3. Connect to that AP and open http://192.168.4.1 in a browser
   4. You should see the mode selector dashboard
+
+  Quick batch test cycle:
+     Plug in -> auto-flash -> hear 4 beeps -> unplug -> next board
 
 
   TROUBLESHOOTING
