@@ -126,25 +126,81 @@ On power-up, the device starts a WiFi access point (`oui-spy` / `ouispy123` by d
 
 ## Flashing
 
-### Quick Flash (no PlatformIO needed)
+Everything you need to flash a board is included in the repo. No PlatformIO or build tools required -- just Python and a USB cable.
 
-Just Python, a USB cable, and the `firmware/` folder. Everything you need is included in the repo.
+### What You Need
 
-**1. Install dependencies:**
+- **Python 3.8 or newer** -- [download here](https://www.python.org/downloads/) if you don't have it
+  - Windows: check **"Add Python to PATH"** during install
+  - macOS: `brew install python3` or use the installer from python.org
+  - Linux: `sudo apt install python3 python3-pip`
+- **USB-C data cable** -- must be a data cable, not a charge-only cable
+- **USB drivers** (if your OS doesn't auto-detect the board):
+  - CH340/CH341: https://www.wch-ic.com/downloads/CH341SER_ZIP.html
+  - CP210x: https://www.silabs.com/developers/usb-to-uart-bridge-vcp-drivers
+
+### Step 1: Install Dependencies
+
+```bash
+pip install -r requirements.txt
+```
+
+Or manually:
 
 ```bash
 pip install esptool pyserial
 ```
 
-**2. Plug in your XIAO ESP32-S3 via USB.**
+> **Note:** On some systems you may need to use `pip3` instead of `pip`, and `python3` instead of `python`.
 
-**3. Flash:**
+### Step 2: Flash a Single Board
+
+1. Plug in your XIAO ESP32-S3 via USB-C
+2. Run:
 
 ```bash
-python flash.py
+python3 flash.py
 ```
 
-The script auto-detects your board, confirms before flashing, and writes all four binary files in one shot:
+3. The script auto-detects your board and the firmware
+4. Type `y` and press Enter to confirm
+5. Wait for "Done!" -- the board reboots automatically and plays a boot melody
+
+### Step 3: Verify It Worked
+
+1. On your phone or laptop, look for the WiFi network **`oui-spy`**
+2. Connect with password **`ouispy123`**
+3. Open **http://192.168.4.1** in your browser
+4. You should see the mode selector dashboard
+
+### Batch Mode (Multiple Boards)
+
+For flashing many boards in a row. Fully hands-free -- no button presses or typing between boards.
+
+```bash
+python3 flash.py --batch
+```
+
+**How it works:**
+
+1. The script starts and waits for a board
+2. Plug in a board -- it is detected and flashed automatically
+3. When flashing finishes (you'll hear a chime on macOS), unplug the board
+4. Plug in the next board -- flashing starts automatically
+5. Repeat until all boards are done
+6. Press **Ctrl+C** to stop
+
+The script never times out. It will wait as long as needed for the next board. It also tracks how many boards were flashed successfully vs. failed.
+
+To erase flash completely before writing (clean slate, recommended for first-time flash):
+
+```bash
+python3 flash.py --batch --erase
+```
+
+### What Gets Flashed
+
+The flasher writes all four binary files from the `firmware/` folder in one shot:
 
 | File | Offset | Purpose |
 |------|--------|---------|
@@ -153,27 +209,33 @@ The script auto-detects your board, confirms before flashing, and writes all fou
 | `boot_app0.bin` | `0xe000` | OTA data partition |
 | `oui-spy-unified-blue.bin` | `0x10000` | Application firmware |
 
-All four files are in the `firmware/` folder. The flasher picks them up automatically. You should hear the Zelda boot sound when it finishes.
+All four files must be present in the `firmware/` folder. The script will warn you if any are missing.
 
-**Options:**
+### All Options
 
 ```bash
-python flash.py                        # flash one board (default)
-python flash.py --erase                # full erase before flashing
-python flash.py --batch                # batch mode: flash boards one after another
-python flash.py --batch --erase        # batch + erase (production runs)
-python flash.py my_firmware.bin        # flash a specific .bin file
+python3 flash.py                        # flash one board (interactive)
+python3 flash.py --erase                # full erase before flashing
+python3 flash.py --batch                # batch mode: hands-free, auto-detect
+python3 flash.py --batch --erase        # batch + erase (production runs)
+python3 flash.py my_firmware.bin        # flash a specific .bin file
+python3 flash.py --help                 # show help
 ```
 
-**Troubleshooting:**
+### Troubleshooting
 
-- **No port detected?** Make sure drivers are installed (CH340/CP210x). On macOS, the port shows up as `/dev/cu.usbmodemXXXX`.
-- **Board doesn't boot after flash?** Make sure all four `.bin` files are in the `firmware/` folder. The script will warn you if any are missing.
-- **Multiple boards plugged in?** The script will list all detected ports and let you pick one.
+| Problem | Fix |
+|---------|-----|
+| `python: command not found` | Use `python3` instead of `python` |
+| `esptool not found` | Run `pip install esptool pyserial` (or `pip3`) |
+| No port detected | Check USB cable is a data cable (not charge-only). Install CH340/CP210x drivers. Try a different USB port. |
+| Board doesn't boot after flash | Make sure all 4 `.bin` files are in `firmware/`. Try `python3 flash.py --erase` to do a full erase first. |
+| Multiple serial devices detected | In single mode, the script lets you pick. In batch mode, it auto-selects. Unplug other USB serial devices if you get unexpected behavior. |
+| Permission denied on serial port | Linux: `sudo usermod -a -G dialout $USER` then log out and back in. macOS: should work out of the box. |
 
 ### Building from Source
 
-Requires [PlatformIO](https://platformio.org/).
+Only needed if you want to modify the firmware. Requires [PlatformIO](https://platformio.org/).
 
 ```bash
 pio run                     # build
@@ -190,7 +252,7 @@ cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app
 cp .pio/build/seeed_xiao_esp32s3/firmware.bin firmware/oui-spy-unified-blue.bin
 ```
 
-**Dependencies** (managed by PlatformIO):
+**Build dependencies** (managed by PlatformIO):
 
 - `NimBLE-Arduino` -- BLE scanning
 - `ESP Async WebServer` + `AsyncTCP` -- web interfaces
