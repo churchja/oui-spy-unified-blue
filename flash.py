@@ -61,31 +61,55 @@ BANNER = """
   +==========================================+"""
 
 
-def find_port():
-    """Auto-detect the ESP32 serial port (macOS, Linux, Windows)."""
+def find_esp_candidates():
+    """Return list of ESP32 serial port candidates, best match first.
+    Espressif native USB (VID 303A) is prioritized over generic UART bridges
+    since that's the correct interface for XIAO ESP32-S3 boards.
+    """
     ports = serial.tools.list_ports.comports()
-    candidates = []
+    espressif = []   # VID 303A -- native USB on S3/C5/etc
+    others = []      # CH340, CP210x, FTDI, generic matches
     for p in ports:
         vid = f"{p.vid:04X}" if p.vid else ""
-        if vid in ESP_VIDS:
-            candidates.append(p)
+        if vid == "303A":
+            espressif.append(p)
+        elif vid in ESP_VIDS:
+            others.append(p)
         elif "esp" in (p.description or "").lower():
-            candidates.append(p)
+            others.append(p)
         # macOS
         elif "usbmodem" in (p.device or "").lower():
-            candidates.append(p)
+            others.append(p)
         elif "usbserial" in (p.device or "").lower():
-            candidates.append(p)
+            others.append(p)
         # Linux
         elif "ttyACM" in (p.device or ""):
-            candidates.append(p)
+            others.append(p)
         elif "ttyUSB" in (p.device or ""):
-            candidates.append(p)
+            others.append(p)
         # Windows -- COM ports with a real description (skip built-in COM1)
         elif sys.platform == "win32" and (p.device or "").upper().startswith("COM"):
             port_num = p.device.upper().replace("COM", "")
             if port_num.isdigit() and int(port_num) > 1:
-                candidates.append(p)
+                others.append(p)
+    # Espressif native USB first, then generic UART bridges
+    return espressif + others
+
+
+def find_port(auto_pick=False):
+    """Auto-detect the ESP32 serial port (macOS, Linux, Windows).
+    If auto_pick=True, only match Espressif native USB (VID 303A) to avoid
+    grabbing random UART adapters. Falls back to all candidates in interactive mode.
+    """
+    candidates = find_esp_candidates()
+
+    if auto_pick:
+        # In batch mode, ONLY use Espressif native USB ports (303A)
+        # This prevents flashing random UART adapters on the desk
+        native = [p for p in candidates if p.vid and f"{p.vid:04X}" == "303A"]
+        if len(native) >= 1:
+            return native[0].device
+        return None
 
     if len(candidates) == 1:
         return candidates[0].device
@@ -108,13 +132,13 @@ def find_port():
     return None
 
 
-def wait_for_port(timeout=30):
+def wait_for_port(timeout=30, auto_pick=False):
     """Wait for an ESP32 to appear on USB. Returns port or None."""
     print(f"\n  Waiting for ESP32 (plug in a board)...", end="", flush=True)
     start = time.time()
     last_dot = start
     while time.time() - start < timeout:
-        port = find_port()
+        port = find_port(auto_pick=auto_pick)
         if port:
             print(f" found!")
             return port
@@ -264,58 +288,69 @@ def erase(port):
     print()
 
 
+def wait_for_disconnect(old_port, timeout=30):
+    """Wait for a specific port to disappear (board unplugged)."""
+    start = time.time()
+    while time.time() - start < timeout:
+        ports = [p.device for p in serial.tools.list_ports.comports()]
+        if old_port not in ports:
+            return True
+        time.sleep(0.3)
+    return False
+
+
 def batch_mode(firmware, do_erase=False):
-    """Flash multiple boards one after another."""
+    """Flash multiple boards one after another. Fully hands-free."""
     print(BANNER)
     size_kb = os.path.getsize(firmware) / 1024
     print(f"""
-  BATCH MODE -- flash boards one after another
+  BATCH MODE -- fully automatic
   Firmware:   {os.path.basename(firmware)}  ({size_kb:.0f} KB)
   Erase:      {"YES" if do_erase else "no"}
 
-  Plug in a board, flash, swap, repeat.
-  Press Ctrl+C when done.
+  Just plug in boards one at a time.
+  Flashing starts automatically when a board is detected.
+  Unplug when done, plug in the next one.
+  Press Ctrl+C to stop.
 """)
 
     board_num = 0
     success_count = 0
     fail_count = 0
+    last_port = None
 
     while True:
-        board_num += 1
+        # If we just flashed a board, wait for it to be unplugged
+        if last_port:
+            print("  Waiting for board to be unplugged...", end="", flush=True)
+            if wait_for_disconnect(last_port, timeout=120):
+                print(" unplugged.")
+            else:
+                print(" timeout -- unplug the board and try again.")
+                continue
+            # Brief settle time after disconnect
+            time.sleep(0.5)
 
-        # Wait for a board to appear
-        port = wait_for_port(timeout=300)  # 5 min timeout
-        if not port:
-            print("\n  No board detected. Still waiting? Plug one in and try again.")
-            try:
-                input("  Press Enter to retry, Ctrl+C to quit: ")
-            except KeyboardInterrupt:
-                break
-            continue
+        # Wait for a new board -- never give up, just keep polling
+        port = None
+        while not port:
+            port = wait_for_port(timeout=60, auto_pick=True)
+            if not port:
+                print("  Still waiting... plug in a board (Ctrl+C to quit).")
 
         # Give the port a moment to stabilize (Windows especially needs this)
-        time.sleep(1)
+        time.sleep(1.5)
 
+        board_num += 1
         ok = flash_one(port, firmware, do_erase=do_erase, board_num=board_num)
         if ok:
             success_count += 1
         else:
             fail_count += 1
 
+        last_port = port
         print(f"\n  -- Score: {success_count} flashed, {fail_count} failed --")
-
-        try:
-            resp = input("\n  Swap board and press Enter for next (q to quit): ").strip().lower()
-            if resp in ("q", "quit", "exit"):
-                break
-        except (KeyboardInterrupt, EOFError):
-            break
-
-        # Wait for the old port to disappear and new one to appear
-        print("  Waiting for board swap...", end="", flush=True)
-        time.sleep(2)  # give time for USB disconnect
-        print(" ready.")
+        print(f"  Unplug this board and plug in the next one.")
 
     print(f"""
   +==========================================+
