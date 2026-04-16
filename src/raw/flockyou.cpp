@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include "esp_wifi.h"
 #include <TinyGPS++.h>
+static void fyScanComplete(NimBLEScanResults results);
 
 // ============================================================================
 // CONFIGURATION
@@ -96,6 +97,19 @@ static const uint16_t ble_manufacturer_ids[] = {
 // ============================================================================
 // RAVEN SURVEILLANCE DEVICE UUID PATTERNS
 // ============================================================================
+//
+// Raven gunshot detectors advertise a mix of proprietary UUIDs (in the
+// 0x3100-0x3500 range, reserved by the manufacturer) and standard Bluetooth
+// SIG service UUIDs (0x180A DIS, 0x1809 Health Thermometer, 0x1819 LocNav).
+//
+// The SIG UUIDs are used by THOUSANDS of unrelated BLE devices (smart watches,
+// earbuds, fitness trackers, etc.), so matching on them alone produces massive
+// false positives. Only the proprietary UUIDs are reliable Raven markers.
+//
+// Detection rule:
+//   - PRIMARY:   match at least one proprietary UUID (0x3100-0x3500)  -> is Raven
+//   - SECONDARY: 0x1809 / 0x1819 / 0x180A are used only by estimateRavenFW()
+//                to distinguish firmware versions AFTER a primary match.
 
 #define RAVEN_DEVICE_INFO_SERVICE   "0000180a-0000-1000-8000-00805f9b34fb"
 #define RAVEN_GPS_SERVICE           "00003100-0000-1000-8000-00805f9b34fb"
@@ -106,13 +120,24 @@ static const uint16_t ble_manufacturer_ids[] = {
 #define RAVEN_OLD_HEALTH_SERVICE    "00001809-0000-1000-8000-00805f9b34fb"
 #define RAVEN_OLD_LOCATION_SERVICE  "00001819-0000-1000-8000-00805f9b34fb"
 
+// Proprietary Raven UUIDs -- matching any of these is sufficient to flag as Raven.
+static const char* raven_proprietary_uuids[] = {
+    RAVEN_GPS_SERVICE,
+    RAVEN_POWER_SERVICE,
+    RAVEN_NETWORK_SERVICE,
+    RAVEN_UPLOAD_SERVICE,
+    RAVEN_ERROR_SERVICE
+};
+
+// Full UUID list (proprietary + SIG) exposed only via the /patterns endpoint
+// so the web dashboard can show the complete Raven service fingerprint.
 static const char* raven_service_uuids[] = {
-    RAVEN_DEVICE_INFO_SERVICE,
     RAVEN_GPS_SERVICE,
     RAVEN_POWER_SERVICE,
     RAVEN_NETWORK_SERVICE,
     RAVEN_UPLOAD_SERVICE,
     RAVEN_ERROR_SERVICE,
+    RAVEN_DEVICE_INFO_SERVICE,
     RAVEN_OLD_HEALTH_SERVICE,
     RAVEN_OLD_LOCATION_SERVICE
 };
@@ -166,6 +191,12 @@ static float  fyGPSAcc = 0;
 static bool   fyGPSValid = false;
 static unsigned long fyGPSLastUpdate = 0;
 #define GPS_STALE_MS 30000  // GPS considered stale after 30s without update
+
+// Mutex guarding GPS state. Writes happen from loop() (fyProcessHardwareGPS)
+// and from the AsyncTCP task (/api/gps). Reads happen from the BLE callback
+// task. On 32-bit Xtensa a `double` write is two instructions, so without
+// this a concurrent read can tear a coordinate into two unrelated halves.
+static SemaphoreHandle_t fyGPSMutex = NULL;
 
 // Hardware GPS state (Seeed L76K GNSS module on UART1)
 static TinyGPSPlus fyGPS;
@@ -372,11 +403,14 @@ static bool checkRavenUUID(NimBLEAdvertisedDevice* device, char* out_uuid = null
     if (!device || !device->haveServiceUUID()) return false;
     int count = device->getServiceUUIDCount();
     if (count == 0) return false;
+    // Only match the proprietary 0x3100-0x3500 range. SIG UUIDs (0x180A, 0x1809,
+    // 0x1819) are intentionally excluded here -- they appear on countless
+    // unrelated consumer BLE devices and would produce false positives.
     for (int i = 0; i < count; i++) {
         NimBLEUUID svc = device->getServiceUUID(i);
         std::string str = svc.toString();
-        for (size_t j = 0; j < sizeof(raven_service_uuids)/sizeof(raven_service_uuids[0]); j++) {
-            if (strcasecmp(str.c_str(), raven_service_uuids[j]) == 0) {
+        for (size_t j = 0; j < sizeof(raven_proprietary_uuids)/sizeof(raven_proprietary_uuids[0]); j++) {
+            if (strcasecmp(str.c_str(), raven_proprietary_uuids[j]) == 0) {
                 if (out_uuid) strncpy(out_uuid, str.c_str(), 40);
                 return true;
             }
@@ -409,12 +443,28 @@ static bool fyGPSIsFresh() {
     return fyGPSValid && (millis() - fyGPSLastUpdate < GPS_STALE_MS);
 }
 
+// Atomic snapshot of GPS state. Returns true with fresh (lat,lon,acc) filled
+// in, false if GPS is stale/invalid or the mutex could not be taken.
+static bool fyGPSSnapshot(double& lat, double& lon, float& acc) {
+    if (!fyGPSMutex || xSemaphoreTake(fyGPSMutex, pdMS_TO_TICKS(20)) != pdTRUE) return false;
+    bool fresh = fyGPSValid && (millis() - fyGPSLastUpdate < GPS_STALE_MS);
+    if (fresh) {
+        lat = fyGPSLat;
+        lon = fyGPSLon;
+        acc = fyGPSAcc;
+    }
+    xSemaphoreGive(fyGPSMutex);
+    return fresh;
+}
+
 static void fyAttachGPS(FYDetection& d) {
-    if (fyGPSIsFresh()) {
+    double lat, lon;
+    float acc;
+    if (fyGPSSnapshot(lat, lon, acc)) {
         d.hasGPS = true;
-        d.gpsLat = fyGPSLat;
-        d.gpsLon = fyGPSLon;
-        d.gpsAcc = fyGPSAcc;
+        d.gpsLat = lat;
+        d.gpsLon = lon;
+        d.gpsAcc = acc;
     }
 }
 
@@ -458,14 +508,20 @@ static void fyProcessHardwareGPS() {
         }
         fyHWGPSFix = true;
         fyGPSIsHardware = true;
-        fyGPSLat = fyGPS.location.lat();
-        fyGPSLon = fyGPS.location.lng();
-        fyGPSAcc = fyGPS.hdop.isValid() ? (float)(fyGPS.hdop.hdop() * GPS_HDOP_SCALE) : 10.0f;
-        fyGPSValid = true;
-        fyGPSLastUpdate = millis();
+        if (fyGPSMutex && xSemaphoreTake(fyGPSMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            fyGPSLat = fyGPS.location.lat();
+            fyGPSLon = fyGPS.location.lng();
+            fyGPSAcc = fyGPS.hdop.isValid() ? (float)(fyGPS.hdop.hdop() * GPS_HDOP_SCALE) : 10.0f;
+            fyGPSValid = true;
+            fyGPSLastUpdate = millis();
+            xSemaphoreGive(fyGPSMutex);
+        }
     } else if (fyHWGPSFix && fyGPS.location.isValid()) {
         // Keep updating timestamp while fix is held
-        fyGPSLastUpdate = millis();
+        if (fyGPSMutex && xSemaphoreTake(fyGPSMutex, pdMS_TO_TICKS(20)) == pdTRUE) {
+            fyGPSLastUpdate = millis();
+            xSemaphoreGive(fyGPSMutex);
+        }
     }
 }
 
@@ -478,7 +534,8 @@ static int fyAddDetection(const char* mac, const char* name, int rssi,
                           const char* ravenFW = "") {
     if (!fyMutex || xSemaphoreTake(fyMutex, pdMS_TO_TICKS(100)) != pdTRUE) return -1;
 
-    // Update existing by MAC
+    // Update existing by MAC. Name is stored raw -- output-side JSON/CSV
+    // escapers (fyJsonEscape, fyCsvEscape) handle quoting and control chars.
     for (int i = 0; i < fyDetCount; i++) {
         if (strcasecmp(fyDet[i].mac, mac) == 0) {
             fyDet[i].count++;
@@ -486,6 +543,7 @@ static int fyAddDetection(const char* mac, const char* name, int rssi,
             fyDet[i].rssi = rssi;
             if (name && name[0]) {
                 strncpy(fyDet[i].name, name, sizeof(fyDet[i].name) - 1);
+                fyDet[i].name[sizeof(fyDet[i].name) - 1] = '\0';
             }
             // Update GPS on every re-sighting (captures movement)
             fyAttachGPS(fyDet[i]);
@@ -499,11 +557,9 @@ static int fyAddDetection(const char* mac, const char* name, int rssi,
         FYDetection& d = fyDet[fyDetCount];
         memset(&d, 0, sizeof(d));
         strncpy(d.mac, mac, sizeof(d.mac) - 1);
-        // Sanitize name for JSON safety
         if (name) {
-            for (int j = 0; j < (int)sizeof(d.name) - 1 && name[j]; j++) {
-                d.name[j] = (name[j] == '"' || name[j] == '\\') ? '_' : name[j];
-            }
+            strncpy(d.name, name, sizeof(d.name) - 1);
+            // memset zeroed the buffer, strncpy's n-1 cap leaves the final byte NUL
         }
         d.rssi = rssi;
         strncpy(d.method, method, sizeof(d.method) - 1);
@@ -596,12 +652,14 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
                    idx >= 0 ? fyDet[idx].count : 0);
 
             // JSON serial output (Flask-compatible format for live ingestion)
-            // Build GPS fragment if available
+            // Build GPS fragment if available (atomic snapshot -- no torn reads)
             char gpsBuf[80] = "";
-            if (fyGPSIsFresh()) {
+            double gLat, gLon;
+            float gAcc;
+            if (fyGPSSnapshot(gLat, gLon, gAcc)) {
                 snprintf(gpsBuf, sizeof(gpsBuf),
                     ",\"gps\":{\"latitude\":%.8f,\"longitude\":%.8f,\"accuracy\":%.1f}",
-                    fyGPSLat, fyGPSLon, fyGPSAcc);
+                    gLat, gLon, gAcc);
             }
             if (isRaven) {
                 printf("{\"detection_method\":\"%s\",\"protocol\":\"bluetooth_le\","
@@ -630,18 +688,87 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
 // JSON HELPER
 // ============================================================================
 
+// RFC 8259-compliant JSON string escaper. Writes `src` to `out` as a JSON
+// string body (no surrounding quotes). Bails cleanly if out_sz is too small,
+// always null-terminating. Characters that must be escaped per RFC:
+//   "  \\  and all control chars U+0000..U+001F.
+// Non-ASCII bytes (UTF-8 continuation) pass through unchanged -- modern JSON
+// parsers handle UTF-8 natively. Anything that can't be escaped and doesn't
+// fit gets truncated at the last safe boundary.
+static void fyJsonEscape(char* out, size_t out_sz, const char* src) {
+    if (!out || out_sz == 0) return;
+    size_t o = 0;
+    if (!src) { out[0] = '\0'; return; }
+    while (*src && o + 7 < out_sz) {  // 7 = worst case "\u00XX" + NUL
+        unsigned char c = (unsigned char)*src++;
+        switch (c) {
+            case '"':  out[o++] = '\\'; out[o++] = '"';  break;
+            case '\\': out[o++] = '\\'; out[o++] = '\\'; break;
+            case '\b': out[o++] = '\\'; out[o++] = 'b';  break;
+            case '\f': out[o++] = '\\'; out[o++] = 'f';  break;
+            case '\n': out[o++] = '\\'; out[o++] = 'n';  break;
+            case '\r': out[o++] = '\\'; out[o++] = 'r';  break;
+            case '\t': out[o++] = '\\'; out[o++] = 't';  break;
+            default:
+                if (c < 0x20) {
+                    // Remaining control chars -> \u00XX
+                    static const char hex[] = "0123456789abcdef";
+                    out[o++] = '\\'; out[o++] = 'u';
+                    out[o++] = '0';  out[o++] = '0';
+                    out[o++] = hex[(c >> 4) & 0xF];
+                    out[o++] = hex[c & 0xF];
+                } else {
+                    out[o++] = (char)c;
+                }
+        }
+    }
+    out[o] = '\0';
+}
+
+// RFC 4180 CSV string escaper. Wraps fields containing commas, quotes, CR,
+// or LF in surrounding quotes and doubles any embedded quotes. Writes a
+// complete quoted field (including the outer quotes) into `out`.
+static void fyCsvEscape(char* out, size_t out_sz, const char* src) {
+    if (!out || out_sz < 3) { if (out && out_sz) out[0] = '\0'; return; }
+    size_t o = 0;
+    out[o++] = '"';
+    if (src) {
+        while (*src && o + 2 < out_sz) {  // leave room for closing quote + NUL
+            char c = *src++;
+            if (c == '"') {
+                if (o + 3 >= out_sz) break;  // need room for "" + closing + NUL
+                out[o++] = '"';
+                out[o++] = '"';
+            } else {
+                out[o++] = c;
+            }
+        }
+    }
+    out[o++] = '"';
+    out[o] = '\0';
+}
+
 static void writeDetectionsJSON(AsyncResponseStream *resp) {
     resp->print("[");
     if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+        // Escape buffers -- sized for worst-case expansion (6x for \u00XX).
+        char macEsc[18 * 6 + 1];
+        char nameEsc[48 * 6 + 1];
+        char methodEsc[24 * 6 + 1];
+        char fwEsc[16 * 6 + 1];
         for (int i = 0; i < fyDetCount; i++) {
             if (i > 0) resp->print(",");
+            fyJsonEscape(macEsc,    sizeof(macEsc),    fyDet[i].mac);
+            fyJsonEscape(nameEsc,   sizeof(nameEsc),   fyDet[i].name);
+            fyJsonEscape(methodEsc, sizeof(methodEsc), fyDet[i].method);
+            fyJsonEscape(fwEsc,     sizeof(fwEsc),     fyDet[i].ravenFW);
             resp->printf(
                 "{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
                 "\"first\":%lu,\"last\":%lu,\"count\":%d,"
                 "\"raven\":%s,\"fw\":\"%s\"",
-                fyDet[i].mac, fyDet[i].name, fyDet[i].rssi, fyDet[i].method,
+                macEsc, nameEsc, fyDet[i].rssi, methodEsc,
                 fyDet[i].firstSeen, fyDet[i].lastSeen, fyDet[i].count,
-                fyDet[i].isRaven ? "true" : "false", fyDet[i].ravenFW);
+                fyDet[i].isRaven ? "true" : "false", fwEsc);
             // Append GPS if present
             if (fyDet[i].hasGPS) {
                 resp->printf(",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}",
@@ -658,32 +785,93 @@ static void writeDetectionsJSON(AsyncResponseStream *resp) {
 // SESSION PERSISTENCE (SPIFFS)
 // ============================================================================
 
+#define FY_SESSION_TMP "/session.tmp"
+
+// Atomic session save: writes to a temp file, closes it, then swaps it into
+// place only after a full successful write. Prevents corrupt half-written
+// session.json files on power loss (which would otherwise get promoted to
+// prev_session.json on next boot and propagate corruption).
+// Also JSON-escapes every string field so BLE names with control chars or
+// quotes can't break the output.
 static void fySaveSession() {
     if (!fySpiffsReady || !fyMutex) return;
     if (xSemaphoreTake(fyMutex, pdMS_TO_TICKS(300)) != pdTRUE) return;
 
-    File f = SPIFFS.open(FY_SESSION_FILE, "w");
+    // Stale tmp from a prior crashed save? Clear it first.
+    if (SPIFFS.exists(FY_SESSION_TMP)) SPIFFS.remove(FY_SESSION_TMP);
+
+    File f = SPIFFS.open(FY_SESSION_TMP, "w");
     if (!f) { xSemaphoreGive(fyMutex); return; }
 
-    f.print("[");
-    for (int i = 0; i < fyDetCount; i++) {
-        if (i > 0) f.print(",");
+    char macEsc[18 * 6 + 1];
+    char nameEsc[48 * 6 + 1];
+    char methodEsc[24 * 6 + 1];
+    char fwEsc[16 * 6 + 1];
+
+    bool ok = true;
+    size_t written = 1;  // account for opening '['
+    if (f.print("[") != 1) ok = false;
+    for (int i = 0; ok && i < fyDetCount; i++) {
+        if (i > 0 && f.print(",") != 1) { ok = false; break; }
         FYDetection& d = fyDet[i];
-        f.printf("{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
-                 "\"first\":%lu,\"last\":%lu,\"count\":%d,"
-                 "\"raven\":%s,\"fw\":\"%s\"",
-                 d.mac, d.name, d.rssi, d.method,
-                 d.firstSeen, d.lastSeen, d.count,
-                 d.isRaven ? "true" : "false", d.ravenFW);
+        fyJsonEscape(macEsc,    sizeof(macEsc),    d.mac);
+        fyJsonEscape(nameEsc,   sizeof(nameEsc),   d.name);
+        fyJsonEscape(methodEsc, sizeof(methodEsc), d.method);
+        fyJsonEscape(fwEsc,     sizeof(fwEsc),     d.ravenFW);
+        int n = f.printf("{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
+                         "\"first\":%lu,\"last\":%lu,\"count\":%d,"
+                         "\"raven\":%s,\"fw\":\"%s\"",
+                         macEsc, nameEsc, d.rssi, methodEsc,
+                         d.firstSeen, d.lastSeen, d.count,
+                         d.isRaven ? "true" : "false", fwEsc);
+        if (n <= 0) { ok = false; break; }
+        written += n;
         if (d.hasGPS) {
-            f.printf(",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}", d.gpsLat, d.gpsLon, d.gpsAcc);
+            n = f.printf(",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}",
+                         d.gpsLat, d.gpsLon, d.gpsAcc);
+            if (n <= 0) { ok = false; break; }
+            written += n;
         }
-        f.print("}");
+        if (f.print("}") != 1) { ok = false; break; }
+        written += 1;
     }
-    f.print("]");
+    if (ok && f.print("]") != 1) ok = false;
     f.close();
+
+    if (!ok) {
+        printf("[FLOCK-YOU] Session save FAILED (write error) - tmp file discarded\n");
+        SPIFFS.remove(FY_SESSION_TMP);
+        xSemaphoreGive(fyMutex);
+        return;
+    }
+
+    // Atomic swap: remove old, rename tmp. SPIFFS.rename() is noted as
+    // unreliable elsewhere in this file, so do it as delete+copy+delete.
+    if (SPIFFS.exists(FY_SESSION_FILE)) SPIFFS.remove(FY_SESSION_FILE);
+
+    File src = SPIFFS.open(FY_SESSION_TMP, "r");
+    File dst = SPIFFS.open(FY_SESSION_FILE, "w");
+    if (!src || !dst) {
+        printf("[FLOCK-YOU] Session save FAILED (swap error)\n");
+        if (src) src.close();
+        if (dst) dst.close();
+        SPIFFS.remove(FY_SESSION_TMP);
+        xSemaphoreGive(fyMutex);
+        return;
+    }
+    uint8_t buf[256];
+    while (src.available()) {
+        size_t r = src.read(buf, sizeof(buf));
+        if (r == 0) break;
+        dst.write(buf, r);
+    }
+    src.close();
+    dst.close();
+    SPIFFS.remove(FY_SESSION_TMP);
+
     fyLastSaveCount = fyDetCount;
-    printf("[FLOCK-YOU] Session saved: %d detections\n", fyDetCount);
+    printf("[FLOCK-YOU] Session saved: %d detections (%u bytes)\n",
+           fyDetCount, (unsigned)written);
     xSemaphoreGive(fyMutex);
 }
 
@@ -841,104 +1029,47 @@ h4{color:#ec4899;font-size:14px;margin-bottom:8px}
 </div>
 <script>
 let D=[],H=[];
+// HTML-escape server-supplied strings before injecting into innerHTML.
+// Fields like d.name, d.method, d.mac, d.fw, and the pattern lists come
+// from BLE advertisements or pattern DBs -- a hostile beacon could inject
+// <script> or event-handler payloads otherwise.
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];});}
 function tab(i,el){document.querySelectorAll('.tb button').forEach(b=>b.classList.remove('a'));document.querySelectorAll('.pn').forEach(p=>p.classList.remove('a'));el.classList.add('a');document.getElementById('p'+i).classList.add('a');if(i===1&&!window._hL)loadHistory();if(i===2&&!window._pL)loadPat();}
 function refresh(){fetch('/api/detections').then(r=>r.json()).then(d=>{D=d;render();stats();}).catch(()=>{});}
 function render(){const el=document.getElementById('dL');if(!D.length){el.innerHTML='<div class="empty">Scanning for surveillance devices...<br>BLE active on all channels</div>';return;}
 D.sort((a,b)=>b.last-a.last);el.innerHTML=D.map(card).join('');}
 function stats(){document.getElementById('sT').textContent=D.length;document.getElementById('sR').textContent=D.filter(d=>d.raven).length;
-fetch('/api/stats').then(r=>r.json()).then(s=>{let g=document.getElementById('sG'),gl=document.getElementById('sGL');if(s.gps_src==='hw'){g.textContent=s.gps_sats+'sat';g.style.color='#22c55e';gl.textContent='HW GPS';}else if(s.gps_src==='phone'){gl.textContent='PHONE';/* let sendGPS control the main indicator */}else if(s.gps_hw_detected){g.textContent=s.gps_sats+'sat';g.style.color='#facc15';gl.textContent='NO FIX';}else if(!_gTried){g.textContent='TAP';g.style.color='#ef4444';gl.textContent='GPS';}else{gl.textContent='GPS';}}).catch(()=>{});}
-function card(d){return '<div class="det"><div class="mac">'+d.mac+(d.name?'<span class="nm">'+d.name+'</span>':'')+'</div><div class="inf"><span>RSSI: '+d.rssi+'</span><span>'+d.method+'</span><span style="color:#ec4899;font-weight:bold">&times;'+d.count+'</span>'+(d.raven?'<span class="rv">RAVEN '+d.fw+'</span>':'')+(d.gps?'<span style="color:#22c55e">&#9673; '+d.gps.lat.toFixed(5)+','+d.gps.lon.toFixed(5)+'</span>':'<span style="color:#666">no gps</span>')+'</div></div>';}
+fetch('/api/stats').then(r=>r.json()).then(s=>{let g=document.getElementById('sG'),gl=document.getElementById('sGL');if(s.gps_src==='hw'){g.textContent=s.gps_sats+'sat';g.style.color='#22c55e';gl.textContent='HW GPS';}else if(s.gps_src==='phone'){g.textContent=s.gps_tagged+'/'+s.total;g.style.color='#22c55e';gl.textContent='PHONE';}else if(s.gps_hw_detected){g.textContent=s.gps_sats+'sat';g.style.color='#facc15';gl.textContent='NO FIX';}else{g.textContent='TAP';g.style.color='#ef4444';gl.textContent='GPS';}}).catch(()=>{});}
+function card(d){return '<div class="det"><div class="mac">'+esc(d.mac)+(d.name?'<span class="nm">'+esc(d.name)+'</span>':'')+'</div><div class="inf"><span>RSSI: '+(+d.rssi|0)+'</span><span>'+esc(d.method)+'</span><span style="color:#ec4899;font-weight:bold">&times;'+(+d.count|0)+'</span>'+(d.raven?'<span class="rv">RAVEN '+esc(d.fw)+'</span>':'')+(d.gps?'<span style="color:#22c55e">&#9673; '+(+d.gps.lat).toFixed(5)+','+(+d.gps.lon).toFixed(5)+'</span>':'<span style="color:#666">no gps</span>')+'</div></div>';}
 function loadHistory(){fetch('/api/history').then(r=>r.json()).then(d=>{H=d;let el=document.getElementById('hL');if(!H.length){el.innerHTML='<div class="empty">No prior session data</div>';return;}
 H.sort((a,b)=>b.last-a.last);el.innerHTML='<div style="font-size:11px;color:#8b5cf6;margin-bottom:8px">'+H.length+' detections from prior session</div>'+H.map(card).join('');window._hL=1;}).catch(()=>{document.getElementById('hL').innerHTML='<div class="empty">No prior session data</div>';});}
 function loadPat(){fetch('/api/patterns').then(r=>r.json()).then(p=>{let h='';
-h+='<div class="pg"><h3>MAC Prefixes ('+p.macs.length+')</h3><div class="it">'+p.macs.map(m=>'<span>'+m+'</span>').join('')+'</div></div>';
-h+='<div class="pg"><h3>BLE Device Names ('+p.names.length+')</h3><div class="it">'+p.names.map(n=>'<span>'+n+'</span>').join('')+'</div></div>';
+h+='<div class="pg"><h3>MAC Prefixes ('+p.macs.length+')</h3><div class="it">'+p.macs.map(m=>'<span>'+esc(m)+'</span>').join('')+'</div></div>';
+h+='<div class="pg"><h3>BLE Device Names ('+p.names.length+')</h3><div class="it">'+p.names.map(n=>'<span>'+esc(n)+'</span>').join('')+'</div></div>';
 h+='<div class="pg"><h3>BLE Manufacturer IDs ('+p.mfr.length+')</h3><div class="it">'+p.mfr.map(m=>'<span>0x'+m.toString(16).toUpperCase().padStart(4,'0')+'</span>').join('')+'</div></div>';
-h+='<div class="pg"><h3>Raven UUIDs ('+p.raven.length+')</h3><div class="it">'+p.raven.map(u=>'<span style="font-size:8px">'+u+'</span>').join('')+'</div></div>';
+h+='<div class="pg"><h3>Raven UUIDs ('+p.raven.length+')</h3><div class="it">'+p.raven.map(u=>'<span style="font-size:8px">'+esc(u)+'</span>').join('')+'</div></div>';
 document.getElementById('pC').innerHTML=h;window._pL=1;}).catch(()=>{});}
 // GPS from phone -> ESP32 (wardriving)
-// Robust GPS with auto-restart, health monitoring, and GrapheneOS support.
-// HTTP works on: Android Chrome with chrome://flags "Insecure origins treated as secure".
+// NOTE: Geolocation API needs secure context (HTTPS) on most browsers.
+// HTTP works on: Android Chrome (local IPs), some Android browsers.
 // Won't work on: iOS Safari (needs HTTPS always).
-let _gW=null,_gOk=false,_gTried=false,_gLastFix=0,_gDenied=false,_gSendFails=0;
-const GPS_HEALTH_MS=10000;   // check GPS health every 10s
-const GPS_STALE_JS=20000;    // restart watch if no fix for 20s (must be < ESP32 GPS_STALE_MS of 30s)
-const GPS_MAX_AGE=15000;     // accept cached positions up to 15s old (GrapheneOS can be slow)
-const GPS_TIMEOUT=30000;     // allow 30s for position (GrapheneOS device-only GPS needs time)
-
-function sendGPS(p){
-  _gOk=true;_gLastFix=Date.now();_gSendFails=0;
-  let g=document.getElementById('sG');g.style.color='#22c55e';
-  g.textContent=p.coords.accuracy<50?'OK':'~'+Math.round(p.coords.accuracy)+'m';
-  fetch('/api/gps?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&acc='+(p.coords.accuracy||0))
-    .then(r=>{if(!r.ok)_gSendFails++;})
-    .catch(()=>{_gSendFails++;if(_gSendFails>3){g.textContent='SEND';g.style.color='#facc15';}});
-}
-
-function gpsErr(e){
-  let g=document.getElementById('sG');
-  if(e.code===1){
-    _gDenied=true;_gOk=false;g.textContent='DENIED';g.style.color='#ef4444';
-    alert('GPS permission denied.\\n\\nAndroid Chrome: tap the lock/info icon in the address bar and allow Location.\\n\\nAlso check chrome://flags -> "Insecure origins treated as secure" includes http://192.168.4.1\\n\\niPhone: GPS will not work over HTTP.');
-  } else if(e.code===2){
-    g.textContent='N/A';g.style.color='#ef4444';
-  } else if(e.code===3){
-    // Timeout — don't panic, watch continues. Show waiting state.
-    g.textContent='WAIT';g.style.color='#facc15';
-    // If watch has been silent too long, force restart
-    if(_gLastFix>0 && Date.now()-_gLastFix>GPS_STALE_JS){restartGPS();}
-  }
-}
-
-function startGPS(){
-  if(!navigator.geolocation||_gDenied)return false;
-  if(_gW!==null){navigator.geolocation.clearWatch(_gW);_gW=null;}
-  let g=document.getElementById('sG');g.textContent='...';g.style.color='#facc15';
-  _gW=navigator.geolocation.watchPosition(sendGPS,gpsErr,{
-    enableHighAccuracy:true,
-    maximumAge:GPS_MAX_AGE,
-    timeout:GPS_TIMEOUT
-  });
-  return true;
-}
-
-function restartGPS(){
-  if(_gDenied)return;
-  if(_gW!==null){navigator.geolocation.clearWatch(_gW);_gW=null;}
-  _gOk=false;
-  startGPS();
-}
-
-// Health monitor: runs on the poll interval, restarts watch if stale
-function checkGPSHealth(){
-  if(!_gTried||_gDenied)return;
-  let g=document.getElementById('sG');
-  // If we had a fix but it went stale, restart the watch
-  if(_gLastFix>0 && Date.now()-_gLastFix>GPS_STALE_JS){
-    g.textContent='LOST';g.style.color='#facc15';
-    restartGPS();
-  }
-  // If watch was started but never delivered a fix after 45s, restart
-  if(!_gOk && _gTried && _gW!==null && _gLastFix===0){
-    let age=Date.now()-(_gStartTime||Date.now());
-    if(age>45000){restartGPS();}
-  }
-}
-
-let _gStartTime=0;
-function reqGPS(){
-  if(!navigator.geolocation){alert('GPS not available in this browser.');return;}
-  if(_gDenied){alert('GPS was denied. Reload the page and allow location permission when prompted.');return;}
-  // Allow re-tap even if _gOk, so user can force restart if GPS seems stuck
-  if(!window.isSecureContext&&!_gTried){
-    alert('GPS requires a secure context.\\n\\nAndroid Chrome: go to chrome://flags and enable "Insecure origins treated as secure", then add http://192.168.4.1 and relaunch.\\n\\niPhone: GPS will not work over HTTP.');
-  }
-  _gStartTime=Date.now();
-  startGPS();_gTried=true;
-}
-
-// Run GPS health check alongside the existing stats poll
-setInterval(checkGPSHealth,GPS_HEALTH_MS);
+// We only request on user tap (gesture) for best permission prompt chance.
+let _gW=null,_gOk=false,_gTried=false;
+function sendGPS(p){_gOk=true;let g=document.getElementById('sG');g.textContent='OK';g.style.color='#22c55e';
+fetch('/api/gps?lat='+p.coords.latitude+'&lon='+p.coords.longitude+'&acc='+(p.coords.accuracy||0)).catch(()=>{});}
+function gpsErr(e){_gOk=false;let g=document.getElementById('sG');
+var msg='ERR';if(e.code===1){msg='DENIED';g.style.color='#ef4444';alert('GPS permission denied. On iPhone, GPS requires HTTPS which this device cannot provide. On Android Chrome, tap the lock/info icon in the address bar and allow Location.');}
+else if(e.code===2){msg='N/A';g.style.color='#ef4444';}
+else if(e.code===3){msg='WAIT';g.style.color='#facc15';}
+g.textContent=msg;}
+function startGPS(){if(!navigator.geolocation){return false;}
+if(_gW!==null){navigator.geolocation.clearWatch(_gW);_gW=null;}
+let g=document.getElementById('sG');g.textContent='...';g.style.color='#facc15';
+_gW=navigator.geolocation.watchPosition(sendGPS,gpsErr,{enableHighAccuracy:true,maximumAge:5000,timeout:15000});return true;}
+function reqGPS(){if(!navigator.geolocation){alert('GPS not available in this browser.');return;}
+if(_gOk){return;}
+if(!window.isSecureContext){alert('GPS requires a secure context (HTTPS). This HTTP page may not get GPS permission.\\n\\nAndroid Chrome: try chrome://flags and enable "Insecure origins treated as secure", add http://192.168.4.1\\n\\niPhone: GPS will not work over HTTP.');}
+startGPS();_gTried=true;}
 refresh();setInterval(refresh,2500);
 </script></body></html>
 )rawliteral";
@@ -994,13 +1125,21 @@ static void fySetupServer() {
             return;
         }
         if (r->hasParam("lat") && r->hasParam("lon")) {
-            fyGPSLat = r->getParam("lat")->value().toDouble();
-            fyGPSLon = r->getParam("lon")->value().toDouble();
-            fyGPSAcc = r->hasParam("acc") ? r->getParam("acc")->value().toFloat() : 0;
-            fyGPSValid = true;
-            fyGPSLastUpdate = millis();
-            fyGPSIsHardware = false;
-            r->send(200, "application/json", "{\"status\":\"ok\"}");
+            double lat = r->getParam("lat")->value().toDouble();
+            double lon = r->getParam("lon")->value().toDouble();
+            float  acc = r->hasParam("acc") ? r->getParam("acc")->value().toFloat() : 0;
+            if (fyGPSMutex && xSemaphoreTake(fyGPSMutex, pdMS_TO_TICKS(50)) == pdTRUE) {
+                fyGPSLat = lat;
+                fyGPSLon = lon;
+                fyGPSAcc = acc;
+                fyGPSValid = true;
+                fyGPSLastUpdate = millis();
+                fyGPSIsHardware = false;
+                xSemaphoreGive(fyGPSMutex);
+                r->send(200, "application/json", "{\"status\":\"ok\"}");
+            } else {
+                r->send(503, "application/json", "{\"error\":\"busy\"}");
+            }
         } else {
             r->send(400, "application/json", "{\"error\":\"lat,lon required\"}");
         }
@@ -1041,25 +1180,35 @@ static void fySetupServer() {
         r->send(resp);
     });
 
-    // API: Export CSV (downloadable file, includes GPS)
+    // API: Export CSV (downloadable file, includes GPS). Fields containing
+    // quotes, commas, or newlines are wrapped/escaped per RFC 4180.
     fyServer.on("/api/export/csv", HTTP_GET, [](AsyncWebServerRequest *r) {
         AsyncResponseStream *resp = r->beginResponseStream("text/csv");
         resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_detections.csv\"");
         resp->println("mac,name,rssi,method,first_seen_ms,last_seen_ms,count,is_raven,raven_fw,latitude,longitude,gps_accuracy");
         if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
+            // Worst case: every byte becomes "" (2x) plus surrounding quotes
+            char macEsc[18 * 2 + 3];
+            char nameEsc[48 * 2 + 3];
+            char methodEsc[24 * 2 + 3];
+            char fwEsc[16 * 2 + 3];
             for (int i = 0; i < fyDetCount; i++) {
                 FYDetection& d = fyDet[i];
+                fyCsvEscape(macEsc,    sizeof(macEsc),    d.mac);
+                fyCsvEscape(nameEsc,   sizeof(nameEsc),   d.name);
+                fyCsvEscape(methodEsc, sizeof(methodEsc), d.method);
+                fyCsvEscape(fwEsc,     sizeof(fwEsc),     d.ravenFW);
                 if (d.hasGPS) {
-                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",%.8f,%.8f,%.1f\n",
-                        d.mac, d.name, d.rssi, d.method,
+                    resp->printf("%s,%s,%d,%s,%lu,%lu,%d,%s,%s,%.8f,%.8f,%.1f\n",
+                        macEsc, nameEsc, d.rssi, methodEsc,
                         d.firstSeen, d.lastSeen, d.count,
-                        d.isRaven ? "true" : "false", d.ravenFW,
+                        d.isRaven ? "true" : "false", fwEsc,
                         d.gpsLat, d.gpsLon, d.gpsAcc);
                 } else {
-                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",,,\n",
-                        d.mac, d.name, d.rssi, d.method,
+                    resp->printf("%s,%s,%d,%s,%lu,%lu,%d,%s,%s,,,\n",
+                        macEsc, nameEsc, d.rssi, methodEsc,
                         d.firstSeen, d.lastSeen, d.count,
-                        d.isRaven ? "true" : "false", d.ravenFW);
+                        d.isRaven ? "true" : "false", fwEsc);
                 }
             }
             xSemaphoreGive(fyMutex);
@@ -1126,7 +1275,7 @@ static void fySetupServer() {
             int placed = 0;
             for (JsonObject d : doc.as<JsonArray>()) {
                 JsonObject gps = d["gps"];
-                if (!gps || !gps.containsKey("lat")) continue;
+		if (!gps || gps["lat"].isNull()) continue;
                 bool isRaven = d["raven"] | false;
                 resp->printf("<Placemark><name>%s</name>\n", d["mac"] | "?");
                 resp->printf("<styleUrl>#%s</styleUrl>\n", isRaven ? "raven" : "det");
@@ -1207,6 +1356,7 @@ void setup() {
     fyPixel.show();
 
     fyMutex = xSemaphoreCreateMutex();
+    fyGPSMutex = xSemaphoreCreateMutex();
 
     // Init hardware GPS UART (Seeed L76K on D6/D7)
     fyGPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
@@ -1235,8 +1385,8 @@ void setup() {
     fyBLEScan->setInterval(100);
     fyBLEScan->setWindow(99);
 
-    // Kick off the first scan right away
-    fyBLEScan->start(BLE_SCAN_DURATION, false);
+    // Kick off the first scan right away (non-blocking)
+    fyBLEScan->start(BLE_SCAN_DURATION, fyScanComplete, false);
     fyLastBleScan = millis();
     printf("[FLOCK-YOU] BLE scanning ACTIVE\n");
 
@@ -1262,19 +1412,24 @@ void setup() {
     printf("[FLOCK-YOU] Ready - no WiFi connection needed, BLE + AP only\n\n");
 }
 
+// BLE scan completion callback -- fires when a non-blocking scan finishes.
+// Clears results so we don't keep advertisement memory between cycles.
+// Runs on the NimBLE host task, not loop(), so it must not do heavy work.
+static void fyScanComplete(NimBLEScanResults /*results*/) {
+    if (fyBLEScan) fyBLEScan->clearResults();
+}
+
 void loop() {
     flockyouDNS.processNextRequest();  // Captive portal DNS
     fyProcessHardwareGPS();
     fyUpdatePixel();
 
-    // BLE scanning cycle
+    // BLE scanning cycle -- non-blocking form with a completion callback so
+    // GPS NMEA parsing, DNS, and NeoPixel animation keep running during the
+    // scan window. start(duration, cb, continue) returns immediately.
     if (millis() - fyLastBleScan >= BLE_SCAN_INTERVAL && !fyBLEScan->isScanning()) {
-        fyBLEScan->start(BLE_SCAN_DURATION, false);
+        fyBLEScan->start(BLE_SCAN_DURATION, fyScanComplete, false);
         fyLastBleScan = millis();
-    }
-
-    if (!fyBLEScan->isScanning() && millis() - fyLastBleScan > BLE_SCAN_DURATION * 1000) {
-        fyBLEScan->clearResults();
     }
 
     // Heartbeat tracking
