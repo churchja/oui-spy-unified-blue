@@ -6,6 +6,12 @@ One device. Four firmware modes. Select from a boot menu, reboot, and go.
 
 This is a friendly fork of [colonelpanichacks/oui-spy-unified-blue](https://github.com/colonelpanichacks/oui-spy-unified-blue) with a focused audit pass applied. Full list of fork-specific changes is at the bottom of this document.
 
+> **⚠️ TESTING STATUS — PLEASE READ**
+>
+> The audit fixes and new features in this fork (distance estimation, triangulation, heatmap viewer, GPS mutex, XSS hardening, etc.) have been code-reviewed and compile-tested but **have not yet been thoroughly field-tested** against real Flock Safety, Raven, or other surveillance hardware in production environments. Distance estimates rely on an uncalibrated path-loss model that may be significantly off without per-device tuning. Triangulation requires ≥3 GPS-tagged observations and accuracy depends heavily on GPS quality and environmental conditions.
+>
+> **Use at your own discretion.** I will update this notice once field testing is complete. If you encounter issues, please [open an issue](https://github.com/churchja/oui-spy-unified-blue/issues) with details about your hardware, environment, and what you observed.
+
 ---
 
 ## Quick Connect
@@ -311,6 +317,15 @@ This fork started from a straight clone of [colonelpanichacks/oui-spy-unified-bl
 - **ArduinoJson v7 API.** Replaced `containsKey()` (removed in v7) with `.isNull()` checks to match the pinned `@^7.0.4`.
 - **`flash.py` fixes.** Added a `try/except KeyboardInterrupt` inside `batch_mode()` so the "flashed/failed" summary actually prints on Ctrl+C (previously unreachable). Added a warning when multiple native USB boards are detected in batch mode. Removed the `boot_app0.bin` write path.
 - **HTML selector footer.** Said "Hold BOOT 2s" but `BOOT_HOLD_TIME = 1500`. Aligned to "1.5s" in the HTML, pin table, and documentation.
+
+### New features
+
+- **RSSI distance estimation.** Every BLE detection now carries an estimated distance in meters, computed via a log-distance path-loss model. Three fields per detection: `lastDistM` (current sighting), `minDistM` (closest approach this session), `maxDistM` (farthest observation). The dashboard shows `~Xm` and `min:Xm` on every detection card. Distance accuracy is ±50% to ±300% from a single reading — multiple readings from different positions are where triangulation adds real value.
+- **Configurable path-loss model.** The path-loss exponent (`n`) and TX power reference (`txPower`) are adjustable from the dashboard's Tools → Radio Settings panel and persist in NVS across reboots. Defaults are `n=3.0` (urban/suburban) and `txPower=-59 dBm` (common iBeacon reference). Adjust `n` lower (toward 1.6) for open-air line-of-sight, higher (toward 4.5) for dense urban with obstructions.
+- **Gauss-Newton triangulation.** When a MAC accumulates ≥3 GPS-tagged observations, the firmware estimates where the transmitter actually is using non-linear least-squares. Initial guess is the RSSI-weighted centroid; solver iterates in a local tangent plane with step damping. Observations older than 5 minutes are dropped to prevent moving emitters from averaging to a nonsensical midpoint. Results are available via `GET /api/locations` and in the dashboard's Tools → Triangulation panel.
+- **Observation ring buffer.** Each of the 200 detection slots gets a 12-sample ring buffer of `(lat, lon, distance, rssi, timestamp)` tuples, allocated from PSRAM at boot (~77 KB). These feed the triangulation solver.
+- **Standalone heatmap viewer (`heatmap.html`).** A single-file Leaflet-based map viewer in the repo root. Open it in any browser with internet, click Load JSON, pick your exported `flockyou_detections.json`. Renders RSSI-colored detection dots (green=close → red=far), dashed path lines connecting same-MAC detections in time order, and triangulated source pins. Gracefully degrades to a coordinate table when offline.
+- **Updated exports.** JSON includes `dist_m`, `min_dist_m`, `max_dist_m`, and `obs` count per detection. CSV adds three distance columns. KML placemarks show distance info and a new "Estimated Source Locations" folder with distinct target-icon pins for triangulated positions.
 
 ---
 
