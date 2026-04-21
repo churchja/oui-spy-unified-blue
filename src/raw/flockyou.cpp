@@ -27,6 +27,7 @@
 #include <stdint.h>
 #include "esp_wifi.h"
 #include <TinyGPS++.h>
+#include <math.h>
 
 // ============================================================================
 // CONFIGURATION
@@ -40,14 +41,8 @@
 #define GPS_BAUD   9600
 #define GPS_HDOP_SCALE 5.0f  // HDOP * scale ≈ accuracy in meters
 
-// Audio
-#define LOW_FREQ 200
-#define HIGH_FREQ 800
-#define DETECT_FREQ 1000
-#define HEARTBEAT_FREQ 600
-#define BOOT_BEEP_DURATION 300
-#define DETECT_BEEP_DURATION 150
-#define HEARTBEAT_DURATION 100
+// Audio (LEDC channel 0, initialized in setup())
+// Frequencies are set dynamically in fyCaw() and fyBeep()
 
 // NeoPixel
 #define FY_NEOPIXEL_PIN 4
@@ -185,6 +180,22 @@ static unsigned long fyLastSave = 0;
 static int fyLastSaveCount = 0;  // Track changes to avoid unnecessary writes
 static bool fySpiffsReady = false;
 
+// RSSI distance estimation (log-distance path-loss model)
+// distance = 10 ^ ((txPower - RSSI) / (10 * n))
+#define FY_DEFAULT_TX_POWER -59  // Typical BLE measured power at 1m (dBm)
+#define FY_DEFAULT_PL_N     2.5f // Path-loss exponent (suburban default)
+#define FY_PL_N_MIN         1.6f
+#define FY_PL_N_MAX         4.5f
+static float fyPathLossN = FY_DEFAULT_PL_N;
+static int   fyTxPower   = FY_DEFAULT_TX_POWER;
+
+static float fyEstimateDistance(int rssi) {
+    if (rssi >= 0) return 0.0f;
+    float exponent = (float)(fyTxPower - rssi) / (10.0f * fyPathLossN);
+    float dist = powf(10.0f, exponent);
+    return (dist > 999.0f) ? 999.0f : dist;  // Cap at 999m
+}
+
 // ============================================================================
 // AUDIO SYSTEM
 // ============================================================================
@@ -202,6 +213,7 @@ static void fyBeep(int freq, int dur) {
 static void fyCaw(int startFreq, int endFreq, int durationMs, int warbleHz) {
     if (!fyBuzzerOn) return;
     int steps = durationMs / 8;  // 8ms per step
+    if (steps <= 0) return;
     float fStep = (float)(endFreq - startFreq) / steps;
     for (int i = 0; i < steps; i++) {
         int f = startFreq + (int)(fStep * i);
@@ -380,7 +392,7 @@ static bool checkRavenUUID(NimBLEAdvertisedDevice* device, char* out_uuid = null
         std::string str = svc.toString();
         for (size_t j = 0; j < sizeof(raven_service_uuids)/sizeof(raven_service_uuids[0]); j++) {
             if (strcasecmp(str.c_str(), raven_service_uuids[j]) == 0) {
-                if (out_uuid) strncpy(out_uuid, str.c_str(), 40);
+                if (out_uuid) { strncpy(out_uuid, str.c_str(), 39); out_uuid[39] = '\0'; }
                 return true;
             }
         }
@@ -502,10 +514,15 @@ static int fyAddDetection(const char* mac, const char* name, int rssi,
         FYDetection& d = fyDet[fyDetCount];
         memset(&d, 0, sizeof(d));
         strncpy(d.mac, mac, sizeof(d.mac) - 1);
-        // Sanitize name for JSON safety
+        // Sanitize name for JSON/HTML/XML safety
         if (name) {
             for (int j = 0; j < (int)sizeof(d.name) - 1 && name[j]; j++) {
-                d.name[j] = (name[j] == '"' || name[j] == '\\') ? '_' : name[j];
+                char c = name[j];
+                if (c == '"' || c == '\\' || c == '<' || c == '>' || c == '&' || c < 0x20) {
+                    d.name[j] = '_';
+                } else {
+                    d.name[j] = c;
+                }
             }
         }
         d.rssi = rssi;
@@ -641,10 +658,11 @@ static void writeDetectionsJSON(AsyncResponseStream *resp) {
             resp->printf(
                 "{\"mac\":\"%s\",\"name\":\"%s\",\"rssi\":%d,\"method\":\"%s\","
                 "\"first\":%lu,\"last\":%lu,\"count\":%d,"
-                "\"raven\":%s,\"fw\":\"%s\"",
+                "\"raven\":%s,\"fw\":\"%s\",\"dist_m\":%.1f",
                 fyDet[i].mac, fyDet[i].name, fyDet[i].rssi, fyDet[i].method,
                 fyDet[i].firstSeen, fyDet[i].lastSeen, fyDet[i].count,
-                fyDet[i].isRaven ? "true" : "false", fyDet[i].ravenFW);
+                fyDet[i].isRaven ? "true" : "false", fyDet[i].ravenFW,
+                fyEstimateDistance(fyDet[i].rssi));
             // Append GPS if present
             if (fyDet[i].hasGPS) {
                 resp->printf(",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}",
@@ -754,8 +772,9 @@ static void writeDetectionsKML(AsyncResponseStream *resp) {
             if (d.name[0]) resp->printf("<b>Name:</b> %s<br/>", d.name);
             resp->printf("<b>Method:</b> %s<br/>"
                          "<b>RSSI:</b> %d dBm<br/>"
+                         "<b>Distance:</b> ~%.0f m<br/>"
                          "<b>Count:</b> %d<br/>",
-                         d.method, d.rssi, d.count);
+                         d.method, d.rssi, fyEstimateDistance(d.rssi), d.count);
             if (d.isRaven) resp->printf("<b>Raven FW:</b> %s<br/>", d.ravenFW);
             resp->printf("<b>Accuracy:</b> %.1f m", d.gpsAcc);
             resp->print("]]></description>\n");
@@ -840,6 +859,25 @@ h4{color:#ec4899;font-size:14px;margin-bottom:8px}
 <button class="btn" onclick="location.href='/api/history/kml'" style="background:#22c55e">DOWNLOAD PREV KML</button>
 <hr class="sep">
 <button class="btn dng" onclick="if(confirm('Clear all detections?'))fetch('/api/clear').then(()=>refresh())">CLEAR ALL DETECTIONS</button>
+<hr class="sep">
+<h4>RADIO SETTINGS</h4>
+<p style="font-size:10px;color:#8b5cf6;margin-bottom:8px">Adjust path-loss exponent for RSSI distance estimation</p>
+<div style="display:flex;gap:6px;margin-bottom:10px;flex-wrap:wrap">
+<button class="btn" style="flex:1;min-width:80px;padding:6px;font-size:11px;background:#334155" onclick="setN(2.2)">HIGHWAY<br><span style="font-size:9px;opacity:.7">n=2.2</span></button>
+<button class="btn" style="flex:1;min-width:80px;padding:6px;font-size:11px;background:#334155" onclick="setN(2.5)">SUBURBAN<br><span style="font-size:9px;opacity:.7">n=2.5</span></button>
+<button class="btn" style="flex:1;min-width:80px;padding:6px;font-size:11px;background:#334155" onclick="setN(3.0)">URBAN<br><span style="font-size:9px;opacity:.7">n=3.0</span></button>
+<button class="btn" style="flex:1;min-width:80px;padding:6px;font-size:11px;background:#334155" onclick="setN(3.5)">DENSE<br><span style="font-size:9px;opacity:.7">n=3.5</span></button>
+</div>
+<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+<span style="font-size:11px;color:#8b5cf6;min-width:30px">1.6</span>
+<input type="range" id="plSlider" min="16" max="45" value="25" style="flex:1;accent-color:#ec4899" oninput="slidN(this.value)">
+<span style="font-size:11px;color:#8b5cf6;min-width:30px">4.5</span>
+</div>
+<div style="text-align:center;margin-bottom:8px">
+<span style="font-size:16px;font-weight:bold;color:#ec4899" id="plVal">n = 2.5</span>
+<span style="font-size:11px;color:#8b5cf6;margin-left:8px" id="plLabel">(suburban)</span>
+</div>
+<p style="font-size:9px;color:rgba(139,92,246,.5);margin-top:4px">Lower n = open air (highway). Higher n = obstructed (urban). Setting is saved across reboots.</p>
 </div>
 </div>
 <script>
@@ -850,7 +888,10 @@ function render(){const el=document.getElementById('dL');if(!D.length){el.innerH
 D.sort((a,b)=>b.last-a.last);el.innerHTML=D.map(card).join('');}
 function stats(){document.getElementById('sT').textContent=D.length;document.getElementById('sR').textContent=D.filter(d=>d.raven).length;
 fetch('/api/stats').then(r=>r.json()).then(s=>{let g=document.getElementById('sG'),gl=document.getElementById('sGL');if(s.gps_src==='hw'){g.textContent=s.gps_sats+'sat';g.style.color='#22c55e';gl.textContent='HW GPS';}else if(s.gps_src==='phone'){gl.textContent='PHONE';/* let sendGPS control the main indicator */}else if(s.gps_hw_detected){g.textContent=s.gps_sats+'sat';g.style.color='#facc15';gl.textContent='NO FIX';}else if(!_gTried){g.textContent='TAP';g.style.color='#ef4444';gl.textContent='GPS';}else{gl.textContent='GPS';}}).catch(()=>{});}
-function card(d){return '<div class="det"><div class="mac">'+d.mac+(d.name?'<span class="nm">'+d.name+'</span>':'')+'</div><div class="inf"><span>RSSI: '+d.rssi+'</span><span>'+d.method+'</span><span style="color:#ec4899;font-weight:bold">&times;'+d.count+'</span>'+(d.raven?'<span class="rv">RAVEN '+d.fw+'</span>':'')+(d.gps?'<span style="color:#22c55e">&#9673; '+d.gps.lat.toFixed(5)+','+d.gps.lon.toFixed(5)+'</span>':'<span style="color:#666">no gps</span>')+'</div></div>';}
+function esc(s){if(!s)return '';return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
+function estDist(rssi){if(rssi>=0)return '?';var e=(_txP-rssi)/(10*_plN);var d=Math.pow(10,e);return d>999?'999':Math.round(d);}
+var _plN=2.5,_txP=-59;
+function card(d){var dm=estDist(d.rssi);return '<div class="det"><div class="mac">'+esc(d.mac)+(d.name?'<span class="nm">'+esc(d.name)+'</span>':'')+'</div><div class="inf"><span>RSSI: '+d.rssi+'</span><span style="color:#facc15">~'+dm+'m</span><span>'+esc(d.method)+'</span><span style="color:#ec4899;font-weight:bold">&times;'+d.count+'</span>'+(d.raven?'<span class="rv">RAVEN '+esc(d.fw)+'</span>':'')+(d.gps?'<span style="color:#22c55e">&#9673; '+d.gps.lat.toFixed(5)+','+d.gps.lon.toFixed(5)+'</span>':'<span style="color:#666">no gps</span>')+'</div></div>';}
 function loadHistory(){fetch('/api/history').then(r=>r.json()).then(d=>{H=d;let el=document.getElementById('hL');if(!H.length){el.innerHTML='<div class="empty">No prior session data</div>';return;}
 H.sort((a,b)=>b.last-a.last);el.innerHTML='<div style="font-size:11px;color:#8b5cf6;margin-bottom:8px">'+H.length+' detections from prior session</div>'+H.map(card).join('');window._hL=1;}).catch(()=>{document.getElementById('hL').innerHTML='<div class="empty">No prior session data</div>';});}
 function loadPat(){fetch('/api/patterns').then(r=>r.json()).then(p=>{let h='';
@@ -859,6 +900,13 @@ h+='<div class="pg"><h3>BLE Device Names ('+p.names.length+')</h3><div class="it
 h+='<div class="pg"><h3>BLE Manufacturer IDs ('+p.mfr.length+')</h3><div class="it">'+p.mfr.map(m=>'<span>0x'+m.toString(16).toUpperCase().padStart(4,'0')+'</span>').join('')+'</div></div>';
 h+='<div class="pg"><h3>Raven UUIDs ('+p.raven.length+')</h3><div class="it">'+p.raven.map(u=>'<span style="font-size:8px">'+u+'</span>').join('')+'</div></div>';
 document.getElementById('pC').innerHTML=h;window._pL=1;}).catch(()=>{});}
+// Radio settings (path-loss exponent)
+function plLabel(n){if(n<=2.0)return 'open air';if(n<=2.3)return 'highway';if(n<=2.7)return 'suburban';if(n<=3.2)return 'urban';return 'dense/indoor';}
+function setN(n){_plN=n;document.getElementById('plSlider').value=Math.round(n*10);document.getElementById('plVal').textContent='n = '+n.toFixed(1);document.getElementById('plLabel').textContent='('+plLabel(n)+')';fetch('/api/settings?pl_n='+n).catch(()=>{});render();}
+function slidN(v){var n=v/10;_plN=n;document.getElementById('plVal').textContent='n = '+n.toFixed(1);document.getElementById('plLabel').textContent='('+plLabel(n)+')';render();}
+document.getElementById('plSlider').addEventListener('change',function(){fetch('/api/settings?pl_n='+(_plN)).catch(()=>{});});
+function loadSettings(){fetch('/api/settings').then(r=>r.json()).then(s=>{_plN=s.pl_n||2.5;_txP=s.tx_power||-59;document.getElementById('plSlider').value=Math.round(_plN*10);document.getElementById('plVal').textContent='n = '+_plN.toFixed(1);document.getElementById('plLabel').textContent='('+plLabel(_plN)+')';render();}).catch(()=>{});}
+loadSettings();
 // GPS from phone -> ESP32 (wardriving)
 // Robust GPS with auto-restart, health monitoring, and GrapheneOS support.
 // HTTP works on: Android Chrome with chrome://flags "Insecure origins treated as secure".
@@ -1009,6 +1057,27 @@ static void fySetupServer() {
         }
     });
 
+    // API: Radio settings (path-loss exponent for distance estimation)
+    fyServer.on("/api/settings", HTTP_GET, [](AsyncWebServerRequest *r) {
+        if (r->hasParam("pl_n")) {
+            float n = r->getParam("pl_n")->value().toFloat();
+            if (n >= FY_PL_N_MIN && n <= FY_PL_N_MAX) {
+                fyPathLossN = n;
+                // Save to NVS
+                Preferences p;
+                p.begin("fy-radio", false);
+                p.putFloat("pl_n", fyPathLossN);
+                p.end();
+                printf("[FLOCK-YOU] Path-loss exponent set to %.1f\n", fyPathLossN);
+            }
+        }
+        char buf[96];
+        snprintf(buf, sizeof(buf),
+            "{\"pl_n\":%.1f,\"tx_power\":%d}",
+            fyPathLossN, fyTxPower);
+        r->send(200, "application/json", buf);
+    });
+
     // API: Pattern database
     fyServer.on("/api/patterns", HTTP_GET, [](AsyncWebServerRequest *r) {
         AsyncResponseStream *resp = r->beginResponseStream("application/json");
@@ -1048,21 +1117,22 @@ static void fySetupServer() {
     fyServer.on("/api/export/csv", HTTP_GET, [](AsyncWebServerRequest *r) {
         AsyncResponseStream *resp = r->beginResponseStream("text/csv");
         resp->addHeader("Content-Disposition", "attachment; filename=\"flockyou_detections.csv\"");
-        resp->println("mac,name,rssi,method,first_seen_ms,last_seen_ms,count,is_raven,raven_fw,latitude,longitude,gps_accuracy");
+        resp->println("mac,name,rssi,method,first_seen_ms,last_seen_ms,count,is_raven,raven_fw,latitude,longitude,gps_accuracy,distance_m");
         if (fyMutex && xSemaphoreTake(fyMutex, pdMS_TO_TICKS(200)) == pdTRUE) {
             for (int i = 0; i < fyDetCount; i++) {
                 FYDetection& d = fyDet[i];
+                float dist = fyEstimateDistance(d.rssi);
                 if (d.hasGPS) {
-                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",%.8f,%.8f,%.1f\n",
+                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",%.8f,%.8f,%.1f,%.1f\n",
                         d.mac, d.name, d.rssi, d.method,
                         d.firstSeen, d.lastSeen, d.count,
                         d.isRaven ? "true" : "false", d.ravenFW,
-                        d.gpsLat, d.gpsLon, d.gpsAcc);
+                        d.gpsLat, d.gpsLon, d.gpsAcc, dist);
                 } else {
-                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",,,\n",
+                    resp->printf("\"%s\",\"%s\",%d,\"%s\",%lu,%lu,%d,%s,\"%s\",,,,%.1f\n",
                         d.mac, d.name, d.rssi, d.method,
                         d.firstSeen, d.lastSeen, d.count,
-                        d.isRaven ? "true" : "false", d.ravenFW);
+                        d.isRaven ? "true" : "false", d.ravenFW, dist);
                 }
             }
             xSemaphoreGive(fyMutex);
@@ -1129,7 +1199,7 @@ static void fySetupServer() {
             int placed = 0;
             for (JsonObject d : doc.as<JsonArray>()) {
                 JsonObject gps = d["gps"];
-                if (!gps || !gps.containsKey("lat")) continue;
+                if (!gps || !gps["lat"].is<double>()) continue;
                 bool isRaven = d["raven"] | false;
                 resp->printf("<Placemark><name>%s</name>\n", d["mac"] | "?");
                 resp->printf("<styleUrl>#%s</styleUrl>\n", isRaven ? "raven" : "det");
@@ -1235,6 +1305,13 @@ void setup() {
     fyBuzzerOn = bzP.getBool("on", true);
     bzP.end();
 
+    // Read radio settings from NVS
+    Preferences rP;
+    rP.begin("fy-radio", true);
+    fyPathLossN = rP.getFloat("pl_n", FY_DEFAULT_PL_N);
+    if (fyPathLossN < FY_PL_N_MIN || fyPathLossN > FY_PL_N_MAX) fyPathLossN = FY_DEFAULT_PL_N;
+    rP.end();
+
     pinMode(BUZZER_PIN, OUTPUT);
     digitalWrite(BUZZER_PIN, LOW);
 
@@ -1276,6 +1353,7 @@ void setup() {
     printf("\n========================================\n");
     printf("  FLOCK-YOU Surveillance Detector\n");
     printf("  Buzzer: %s\n", fyBuzzerOn ? "ON" : "OFF");
+    printf("  Path-loss n: %.1f\n", fyPathLossN);
     printf("  GPS: auto-detect (L76K on D6/D7)\n");
     printf("========================================\n");
 
