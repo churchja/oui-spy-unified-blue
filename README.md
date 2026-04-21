@@ -1,6 +1,6 @@
 # Flock-You GPS & Buzzer Fix Fork
 
-Fork of [colonelpanichacks/oui-spy-unified-blue](https://github.com/colonelpanichacks/oui-spy-unified-blue) with targeted fixes for **Flock-You mode (Mode 4)** — specifically GPS lock loss during wardriving, WiFi dropout on Android, and muffled buzzer audio on boot.
+Fork of [colonelpanichacks/oui-spy-unified-blue](https://github.com/colonelpanichacks/oui-spy-unified-blue) with targeted fixes for **Flock-You mode (Mode 4)** — GPS lock loss during wardriving, WiFi dropout on Android, muffled buzzer audio, and added **RSSI distance estimation** with a configurable path-loss model.
 
 For full documentation on all four firmware modes (Detector, Foxhunter, Flock-You, Sky Spy), the boot selector, flashing with `flash.py`, hardware pinout, and the broader OUI-SPY ecosystem, see the **[original project README](https://github.com/colonelpanichacks/oui-spy-unified-blue)**.
 
@@ -8,55 +8,70 @@ This fork changes a single file: **`src/raw/flockyou.cpp`**
 
 ---
 
-## Why This Fork Exists
-
-Flock-You's GPS wardriving feature relies on the browser Geolocation API to tag surveillance device detections with coordinates. During real-world wardriving sessions, two problems caused most detections to lose their GPS tags:
-
-1. **WiFi dropout** — Android detected that the `flockyou` AP had no internet and silently switched back to mobile data, severing the GPS pipeline entirely
-2. **GPS watch dying** — Chrome's `watchPosition` would stop delivering updates when the screen locked or the tab backgrounded, with no recovery mechanism
-
-In testing, only 8 out of 47 detections (17%) were GPS-tagged. The remaining 39 lost their coordinates to these two issues.
-
-The buzzer also threw `LEDC is not initialized` errors on boot, producing muffled audio.
-
-These fixes improve Flock-You for all Android users and include a complete setup guide for **GrapheneOS**, where additional privacy controls make GPS configuration less obvious.
-
----
-
 ## What Changed
+
+### RSSI Distance Estimation
+
+Every detection now shows an estimated distance in meters based on the received signal strength, using the log-distance path-loss model:
+
+```
+distance = 10 ^ ((txPower - RSSI) / (10 × n))
+```
+
+Where `txPower` is the reference power at 1 meter (-59 dBm default for BLE) and `n` is the path-loss exponent that models signal attenuation in different environments.
+
+**Dashboard changes:**
+
+- Each detection card shows `~Xm` in yellow next to the RSSI value
+- The **Tools** tab has four environment preset buttons and a manual slider
+- Distance is included in JSON, CSV, and KML exports
+- Settings are saved to NVS and persist across reboots
+
+**Presets:**
+
+| Preset | Exponent (n) | Use case |
+|--------|-------------|----------|
+| **HIGHWAY** | 2.2 | Interstate/highway wardriving at 50-85 mph. Cameras are pole-mounted with clear line of sight. Minimal obstructions. |
+| **SUBURBAN** | 2.5 | Mixed residential/commercial roads. Some obstructions from buildings and vegetation. Good general-purpose default. |
+| **URBAN** | 3.0 | City streets with buildings, parked cars, and infrastructure creating multipath reflections. |
+| **DENSE** | 3.5 | Dense urban or areas with significant obstructions between you and the camera. |
+
+The slider allows manual tuning from 1.6 (pure open air) to 4.5 (heavy indoor attenuation) in 0.1 steps. If the default distance numbers feel consistently off, adjust the exponent until they match your observed reality — lower for open areas, higher for obstructed ones.
+
+**API:**
+
+- `GET /api/settings` — returns current path-loss exponent and TX power as JSON
+- `GET /api/settings?pl_n=2.2` — sets the exponent and saves to NVS
 
 ### WiFi Dropout Fix (Android Auto-Switch Prevention)
 
-Android checks specific URLs to determine if a WiFi network has internet access. When those checks fail, Android silently switches back to mobile data — killing the GPS pipeline between the phone and the ESP32. The `flockyou` AP's captive portal DNS already redirects all domains to `192.168.4.1`, but the web server was returning HTML redirects instead of the expected responses.
+Android detects that the `flockyou` AP has no internet and silently switches back to mobile data, severing the GPS pipeline. The fix adds proper handlers for connectivity check URLs from Android, GrapheneOS, Apple, Windows, and Firefox. Returning the expected responses tells the OS "this network has internet" and prevents the switch.
 
-The fix adds proper handlers for connectivity check URLs from all major platforms:
-
-- **Android / GrapheneOS** — responds to `/generate_204` and `/gen_204` with HTTP 204, which is the exact response Android expects to confirm internet connectivity
-- **Apple** — responds to `/hotspot-detect.html` and `/library/test/success.html` with the expected success page
-- **Windows** — responds to `/ncsi.txt` and `/connecttest.txt` with the expected test strings
-- **Firefox** — responds to `/success.txt` with the expected response
-
-The catch-all handler also pattern-matches any connectivity check URLs that might arrive via unexpected paths. This prevents the "Wi-Fi has no internet access" warning and stops Android from switching away from the `flockyou` AP during wardriving sessions.
+This eliminates the "Wi-Fi has no internet access" warning and the captive portal popup on most devices.
 
 ### GPS Auto-Recovery
 
-The browser Geolocation API's `watchPosition` call would silently stop delivering updates when Chrome backgrounded the tab, the phone screen locked, or the OS throttled location services. Once GPS went stale, the ESP32 had no way to know and new detections stopped getting tagged.
+The browser Geolocation API's `watchPosition` would silently stop delivering updates when Chrome backgrounded the tab, the phone screen locked, or the OS throttled location services.
 
-- **Health monitor** — checks every 10 seconds whether GPS is still alive. If the last fix is older than 20 seconds, the watch is torn down and restarted automatically before the ESP32's 30-second stale threshold expires
-- **Relaxed timing** — `maximumAge` increased from 5s to 15s, `timeout` from 15s to 30s, giving device-only GPS (no network assist) enough time to acquire satellites
-- **Manual restart** — tapping the GPS card now always restarts the watch, even if GPS was previously working
-- **Send failure tracking** — after 3 consecutive failed `fetch` calls to `/api/gps`, the indicator shows "SEND" (yellow) so you know the ESP32 isn't receiving coordinates
-- **Smarter UI state** — the stats poll no longer overrides JavaScript-managed GPS state
-- **Accuracy display** — shows accuracy in meters when >50m
-- **Fixed alert text** — double-escaped `\n` now renders as actual line breaks
+- **Health monitor** — checks every 10 seconds, auto-restarts the watch if GPS goes stale (20-second threshold)
+- **Relaxed timing** — `maximumAge` 15s, `timeout` 30s for device-only GPS (GrapheneOS)
+- **Manual restart** — tapping the GPS card always restarts, even after a previous success
+- **Send failure tracking** — shows "SEND" (yellow) after 3 consecutive failed fetch calls
+- **Accuracy display** — shows meters when >50m
 
 ### Buzzer LEDC Fix
 
-The boot crow caw sounded muffled and threw `LEDC is not initialized` errors because `tone()` was called before the ESP32's LEDC peripheral was ready.
+- Explicit LEDC channel 0 initialization in `setup()` before boot audio
+- All `tone()`/`noTone()` replaced with direct `ledcSetup()`/`ledcWrite()` control
+- Eliminates the `LEDC is not initialized` error
 
-- Explicit LEDC channel 0 initialization in `setup()` before any audio plays
-- All `tone()`/`noTone()` calls replaced with direct `ledcSetup()`/`ledcWrite()` control
-- Eliminates the `LEDC is not initialized` error and produces clean crow caw audio on boot
+### Security Audit Fixes
+
+- **XSS prevention** — BLE device names are HTML-escaped before rendering in the dashboard
+- **Expanded name sanitization** — strips `<`, `>`, `&`, and control characters in addition to `"` and `\`
+- **Null terminator safety** — Raven UUID copy guaranteed null-terminated
+- **Division by zero guard** — `fyCaw()` returns early if duration < 8ms
+- **Deprecated API fix** — ArduinoJson `containsKey` replaced with modern `is<T>()` API
 
 ---
 
@@ -122,9 +137,10 @@ With the WiFi dropout fix, you should no longer see the captive portal popup or 
 
 ### 6. Wardriving Tips
 
-- **Disable mobile data** as a belt-and-suspenders measure — even with the connectivity check fix, turning off mobile data guarantees Android can't switch away from the `flockyou` AP
-- **Keep Chrome in the foreground** — if you switch apps, the GPS watch may slow down or stop. The health monitor will restart it, but foreground delivery is more reliable
-- **Check GPS before driving** — confirm the indicator shows green "OK" before heading out. Open a second tab to `http://192.168.4.1/api/stats` and verify `gps_valid` is `true`
+- **Set the path-loss exponent before driving** — tap Tools, then HIGHWAY for interstate or URBAN for city streets
+- **Disable mobile data** as a belt-and-suspenders measure — even with the connectivity check fix, this guarantees Android stays on the `flockyou` AP
+- **Keep Chrome in the foreground** — the GPS health monitor auto-restarts on background, but foreground is more reliable
+- **Check GPS before driving** — confirm green "OK" on the GPS card before heading out
 
 ---
 
@@ -137,19 +153,22 @@ Chrome cached a previous denial. Open an **Incognito tab** to `192.168.4.1` to t
 Device-only GPS can take 30–60 seconds for a cold fix, especially indoors. Move near a window or outside. The firmware allows up to 30 seconds per attempt and retries automatically.
 
 **Still getting "Wi-Fi has no internet access":**
-This should be resolved by the connectivity check fix. If it persists, disable mobile data before connecting to `flockyou` — Android can't switch to what isn't available.
+This should be resolved by the connectivity check fix. If it persists, disable mobile data before connecting to `flockyou`.
+
+**Distance estimates seem wrong:**
+Adjust the path-loss exponent in Tools. If distances are consistently too short, increase n. If too long, decrease n. The model is an approximation — BLE signal strength varies with antenna orientation, obstructions, and multipath reflections.
 
 **`chrome://flags` setting disappeared:**
 GrapheneOS Chrome updates can reset flags. Re-enter `http://192.168.4.1` and relaunch.
 
 **Verifying GPS without a Flock camera nearby:**
-Open a second Chrome tab to `http://192.168.4.1/api/stats` — if `gps_valid` is `true` and `gps_age` is under 5000, coordinates are streaming to the ESP32 and will tag any future detections.
+Open a second Chrome tab to `http://192.168.4.1/api/stats` — if `gps_valid` is `true` and `gps_age` is under 5000, GPS is streaming.
 
 **Serial monitor shows `LEDC is not initialized`:**
-You're running the original firmware, not the patched version. Rebuild and reflash with `pio run -t upload`.
+You're running the original firmware. Rebuild and reflash with `pio run -t upload`.
 
 **PlatformIO flashes the wrong device:**
-If `pio run -t upload` picks the wrong USB device, find the ESP32's port with `ls /dev/cu.usb*` and specify it: `pio run -t upload --upload-port /dev/cu.usbmodem1101`
+Find the ESP32's port with `ls /dev/cu.usb*` and specify it: `pio run -t upload --upload-port /dev/cu.usbmodem1101`
 
 ---
 
@@ -170,12 +189,13 @@ Monitor serial output (optional):
 pio device monitor
 ```
 
-A clean boot should show no LEDC errors:
+A clean boot shows:
 
 ```
 ========================================
   FLOCK-YOU Surveillance Detector
   Buzzer: ON
+  Path-loss n: 2.5
   GPS: auto-detect (L76K on D6/D7)
 ========================================
 [FLOCK-YOU] BLE scanning ACTIVE
