@@ -1168,8 +1168,52 @@ static void fySetupServer() {
         printf("[FLOCK-YOU] All detections cleared (session saved)\n");
     });
 
-    // Captive portal catch-all: redirect any unknown URL to root
+    // ---- Android / iOS / Windows connectivity checks ----
+    // Android checks these URLs to decide if a network has internet.
+    // The captive portal DNS redirects all domains to 192.168.4.1,
+    // so these arrive as local paths. Returning 204 tells Android
+    // "this network has internet" and prevents it from silently
+    // switching back to mobile data.
+    fyServer.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204);
+    });
+    fyServer.on("/gen_204", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204);
+    });
+    // Google connectivity check (some Android versions)
+    fyServer.on("/connectivitycheck", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(204);
+    });
+    // Apple captive portal check (expects 200 with "Success")
+    fyServer.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    });
+    fyServer.on("/library/test/success.html", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/html", "<HTML><HEAD><TITLE>Success</TITLE></HEAD><BODY>Success</BODY></HTML>");
+    });
+    // Windows NCSI check
+    fyServer.on("/ncsi.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft NCSI");
+    });
+    fyServer.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "Microsoft Connect Test");
+    });
+    // Firefox captive portal check
+    fyServer.on("/success.txt", HTTP_GET, [](AsyncWebServerRequest *r) {
+        r->send(200, "text/plain", "success\n");
+    });
+
+    // Captive portal catch-all: serve connectivity checks, redirect the rest
     fyServer.onNotFound([](AsyncWebServerRequest *r) {
+        String url = r->url();
+        // Catch any connectivity check pattern we might have missed
+        if (url.indexOf("generate_204") >= 0 || url.indexOf("gen_204") >= 0 ||
+            url.indexOf("connectivitycheck") >= 0 || url.indexOf("ncsi") >= 0 ||
+            url.indexOf("hotspot-detect") >= 0 || url.indexOf("success") >= 0 ||
+            url.indexOf("connecttest") >= 0 || url.indexOf("redirect") >= 0) {
+            r->send(204);
+            return;
+        }
         r->redirect("http://192.168.4.1/");
     });
 
