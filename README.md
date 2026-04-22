@@ -1,4 +1,13 @@
-# Flock-You GPS & Buzzer Fix Fork
+# Flock-You: oui-spy-flock-you-enhanced
+
+INTERACTIVE https://flockyou.netlify.app/
+
+🛰️ FLOCK-YOU: Open-source BLE wardriving for privacy auditing.
+Turn your ESP32-S3 into a "digital bird dog" that identifies, estimates distance, and logs the coordinates of Flock cameras and Raven sensors.
+
+# FLOCK-YOU
+> **The digital bird dog for your pocket.** Detect, geotag, and map hidden surveillance hardware in real-time.
+> [**View the Dashboard & Setup Guide →**](https://flockyou.netlify.app/)
 
 Fork of [colonelpanichacks/oui-spy-unified-blue](https://github.com/colonelpanichacks/oui-spy-unified-blue) with targeted fixes for **Flock-You mode (Mode 4)** — GPS lock loss during wardriving, WiFi dropout on Android, muffled buzzer audio, and added **RSSI distance estimation** with a configurable path-loss model.
 
