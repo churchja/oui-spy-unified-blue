@@ -9,6 +9,10 @@ void detector_loop();
 void foxhunter_setup();
 void foxhunter_loop();
 
+// Mode 3: Flock-You — Promiscuous WiFi Edition
+void flockyou_promiscious_setup();
+void flockyou_promiscious_loop();
+
 // Mode 4: Flock-You
 void flockyou_setup();
 void flockyou_loop();

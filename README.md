@@ -2,7 +2,7 @@
 
 Multi-mode surveillance detection and BLE intelligence firmware for the **Seeed Studio XIAO ESP32-S3**.
 
-One device. Four firmware modes. Select from a boot menu, reboot, and go.
+One device. Five firmware modes. Select from a boot menu, reboot, and go.
 
 ---
 
@@ -34,7 +34,38 @@ RSSI-based proximity tracker for hunting down a specific BLE device. Lock onto a
 - Audio feedback rate scales inversely with distance
 - Web interface for target selection and RSSI monitoring
 
-### Mode 3: Flock-You
+### Mode 3: Flock-You — Promiscuous WiFi Edition
+
+Passive 2.4 GHz promiscuous-mode detector for Flock Safety surveillance infrastructure. No AP, no transmit — the radio stays dedicated to sniffing while the device hops channels 1 / 6 / 11 at 350 ms dwell. Detections beep, flash, persist to SPIFFS with a CRC envelope, and stream over USB-CDC for live ingestion by the Flask dashboard at [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you).
+
+This is a port of the `promiscious` branch of `flock-you` — see that repo for the full research write-up and the Flask side.
+
+**Detection methods (WiFi only):**
+
+- **addr2 OUI match** — transmitter-side match against the 41-OUI Flock Safety list (29 from @NitekryDPaul's original promiscuous-mode set, 12 from his April 2026 additions). All work of **OrdoOuroborous / [@NitekryDPaul](https://github.com/nitekry)**.
+- **addr1 OUI match** — the receiver-side technique: catches Flock STAs that appear only as the destination of probe responses or data frames during their burst-sleep windows. Mandatory multicast + locally-administered guards before the match. @NitekryDPaul's discovery.
+- **Wildcard probe signature** — Probe Request (type=0 subtype=4) + zero-length SSID IE + known-OUI addr2. The DeFlockJoplin high-precision signature (Joplin drive-test: 11/12 cameras caught with 2 false positives). Suppresses the broad addr2 alert on the same frame to avoid double-counting.
+
+**Features:**
+
+- No AP — radio is dedicated to promiscuous sniffing
+- Audible alerts: two-chirp on new MAC, monotone heartbeat while target stays in range
+- SPIFFS-persisted session with atomic CRC envelope; previous-boot data is preserved
+- USB-CDC command protocol so the host can pull stored detections without re-flashing:
+  - `CMD:DUMP_PREV` — streams the previous session from `/prev_session.json` as replay-flagged JSON
+  - `CMD:DUMP_LIVE` — streams the in-RAM detection table
+  - `CMD:STATUS` / `CMD:VERSION` — device telemetry and firmware identifier
+  - `CMD:CLEAR_PREV` / `CMD:CLEAR_LIVE` — wipe persisted or in-memory state
+- Flask-compatible JSON line per detection on Serial (same schema as the BLE companion)
+
+**Companion dashboard:** `api/flockyou.py` in [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you) exposes the command protocol as REST endpoints — `/api/flock/{status,dump_prev,dump_live,clear_prev,clear_live}` — so the canonical "plug device back in after wardriving" workflow is:
+
+```bash
+curl -X POST http://localhost:5000/api/flock/dump_prev
+curl -X POST http://localhost:5000/api/flock/clear_prev
+```
+
+### Mode 4: Flock-You — BLE Edition
 
 Detects Flock Safety surveillance cameras, Raven gunshot detectors, and related monitoring hardware using BLE-only heuristics. All detections are stored in memory and can be exported as JSON or CSV for later analysis.
 
@@ -69,7 +100,7 @@ After relaunching, connect to the `flockyou` AP, open `192.168.4.1`, and tap the
 
 > **Note:** iOS Safari does not support Geolocation over HTTP. GPS wardriving requires Android with Chrome.
 
-### Mode 4: Sky Spy
+### Mode 5: Sky Spy
 
 Passive drone detection via FAA Remote ID (Open Drone ID) WiFi beacon monitoring. Listens in promiscuous mode for ASTM F3411 compliant broadcasts and extracts drone telemetry.
 
@@ -93,7 +124,8 @@ Each mode creates its own AP. When switching modes, **your phone/laptop will aut
 | **Boot Selector** | `oui-spy` | `ouispy123` | `192.168.4.1` | Configurable from selector UI, saved to NVS |
 | **Detector** | `snoopuntothem` | `astheysnoopuntous` | `192.168.4.1` | Configurable from web dashboard, saved to NVS |
 | **Foxhunter** | `foxhunter` | `foxhunter` | `192.168.4.1` | Fixed credentials |
-| **Flock-You** | `flockyou` | `flockyou123` | `192.168.4.1` | Fixed credentials |
+| **Flock-You WiFi** | *none* | — | — | No AP — radio is dedicated to promiscuous sniffing; talk to it via USB-CDC commands and the Flask dashboard |
+| **Flock-You BLE** | `flockyou` | `flockyou123` | `192.168.4.1` | Fixed credentials |
 | **Sky Spy** | *none* | — | — | No AP — passive scanner, serial JSON output only |
 
 > **Tip:** If you can't reach the dashboard after a mode switch, check which WiFi network you're connected to. Your device may have auto-joined a previously saved OUI-SPY AP from a different mode.

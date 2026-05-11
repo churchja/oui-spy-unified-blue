@@ -143,7 +143,8 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 <div class="m">
 <div class="i" onclick="go(1)"><div class="n">DETECTOR</div><div class="d">BLE Alert Tool for Specific Devices</div></div>
 <div class="i" onclick="go(2)"><div class="n">FOXHUNTER</div><div class="d">RSSI Proximity Tracker</div></div>
-<div class="i" onclick="go(4)"><div class="n">FLOCK-YOU</div><div class="d">Surveillance Detector &bull; AP: flockyou</div></div>
+<div class="i" onclick="go(3)"><div class="n">FLOCK-YOU WIFI</div><div class="d">Promiscuous Mode &bull; @NitekryDPaul / OrdoOuroborous</div></div>
+<div class="i" onclick="go(4)"><div class="n">FLOCK-YOU BLE</div><div class="d">Surveillance Detector &bull; AP: flockyou</div></div>
 <div class="i" onclick="go(5)"><div class="n">SKY SPY</div><div class="d">Drone Remote ID Monitor</div></div>
 </div>
 <div class="ap">
@@ -161,7 +162,7 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 </div>
 </div>
 <script>
-var info={1:{t:'DETECTOR',s:'Scans for BLE devices and alerts when specific targets are detected. Configure OUI prefixes and MAC addresses to monitor.'},2:{t:'FOXHUNTER',s:'Track down a specific device using RSSI signal strength. Beeps get faster as you get closer to your target.'},4:{t:'FLOCK-YOU',s:'Detects Flock Safety surveillance cameras via BLE. Serves web dashboard on AP flockyou with live detections, pattern DB, and JSON/CSV export.'},5:{t:'SKY SPY',s:'Monitors for FAA Remote ID broadcasts from drones. Detects Open Drone ID signals over WiFi and BLE.'}};
+var info={1:{t:'DETECTOR',s:'Scans for BLE devices and alerts when specific targets are detected. Configure OUI prefixes and MAC addresses to monitor.'},2:{t:'FOXHUNTER',s:'Track down a specific device using RSSI signal strength. Beeps get faster as you get closer to your target.'},3:{t:'FLOCK-YOU WIFI',s:'Passive 2.4 GHz promiscuous-mode detector for Flock Safety. Matches addr1/addr2 OUIs and the DeFlockJoplin wildcard-probe signature. Streams Flask-compatible JSON over USB and persists to SPIFFS; pull history via the CMD:DUMP_PREV protocol. No AP.'},4:{t:'FLOCK-YOU BLE',s:'Detects Flock Safety surveillance cameras via BLE. Serves web dashboard on AP flockyou with live detections, pattern DB, and JSON/CSV export.'},5:{t:'SKY SPY',s:'Monitors for FAA Remote ID broadcasts from drones. Detects Open Drone ID signals over WiFi and BLE.'}};
 function go(m){var d=info[m];document.getElementById('yt').textContent=d.t;document.getElementById('ys').textContent=d.s;document.getElementById('x').style.display='none';document.getElementById('y').style.display='flex';fetch('/select?mode='+m)}
 function saveAP(){
 var s=document.getElementById('ap_ssid').value.trim();
@@ -519,6 +520,11 @@ void setup() {
         Serial.println("[OUI-SPY] AP will be: foxhunter");
         Serial.flush();
         foxhunter_setup();
+    } else if (currentMode == 3) {
+        Serial.println("[OUI-SPY] >>> STARTING FLOCK-YOU WIFI (mode 3) <<<");
+        Serial.println("[OUI-SPY] Promiscuous 2.4 GHz sniffer, no AP, USB-CDC sensor");
+        Serial.flush();
+        flockyou_promiscious_setup();
     } else if (currentMode == 4) {
         Serial.println("[OUI-SPY] >>> STARTING FLOCK-YOU (mode 4) <<<");
         Serial.println("[OUI-SPY] No WiFi AP (BLE only)");
@@ -583,7 +589,7 @@ void loop() {
     switch (currentMode) {
         case 1: detector_loop(); break;
         case 2: foxhunter_loop(); break;
-
+        case 3: flockyou_promiscious_loop(); break;
         case 4: flockyou_loop(); break;
         case 5: skyspy_loop(); break;
         default:
