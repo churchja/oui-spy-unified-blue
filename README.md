@@ -58,12 +58,18 @@ This is a port of the `promiscious` branch of `flock-you` — see that repo for 
   - `CMD:CLEAR_PREV` / `CMD:CLEAR_LIVE` — wipe persisted or in-memory state
 - Flask-compatible JSON line per detection on Serial (same schema as the BLE companion)
 
-**Companion dashboard:** `api/flockyou.py` in [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you) exposes the command protocol as REST endpoints — `/api/flock/{status,dump_prev,dump_live,clear_prev,clear_live}` — so the canonical "plug device back in after wardriving" workflow is:
+**Companion dashboard:** `api/flockyou.py` in [colonelpanichacks/flock-you](https://github.com/colonelpanichacks/flock-you) exposes the command protocol as REST endpoints — `/api/flock/{status,version,dump_prev,dump_live,clear_prev,clear_live}` — and surfaces them in the web UI as a five-button Sniffer command bar (**Pull Prev**, **Pull Live**, **Status**, **Clear Prev**, **Clear Live**) that appears once the device is connected.
+
+Replayed detections show up in the detection list with a purple **FLASH** badge (from SPIFFS) or blue **RAM** badge (from the in-memory table), a tinted left border, and `timestamp_source: device_replay`. They don't get GPS temporal matching (the device's stored entries only have monotonic millis, not wall-clock) and never overwrite a fresher live entry for the same MAC. Every command response surfaces as a coloured top-right toast.
+
+The canonical "plug device back in after wardriving" workflow from a terminal:
 
 ```bash
 curl -X POST http://localhost:5000/api/flock/dump_prev
 curl -X POST http://localhost:5000/api/flock/clear_prev
 ```
+
+Full dashboard docs (endpoints, socket events, JSON wire formats, GPS setup, persistence layout, troubleshooting): [colonelpanichacks/flock-you/api/README.md](https://github.com/colonelpanichacks/flock-you/blob/promiscious/api/README.md).
 
 ### Mode 4: Flock-You — BLE Edition
 
