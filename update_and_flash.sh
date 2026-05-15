@@ -14,7 +14,7 @@ COMMIT_MSG="flockyou: sync OUI list with NitekryDPaul / nite-oui-collection
 Patched via patch_ouis.py."
 
 ASSUME_YES="false"; SKIP_GIT="false"; SKIP_FLASH="false"
-SKIP_BUILD="false"; ERASE_FLASH="false"
+SKIP_BUILD="false"; ERASE_FLASH="false"; SKIP_PATCH="false"
 
 for arg in "$@"; do
     case "$arg" in
@@ -22,6 +22,7 @@ for arg in "$@"; do
         --skip-git)   SKIP_GIT="true" ;;
         --skip-flash) SKIP_FLASH="true" ;;
         --skip-build) SKIP_BUILD="true" ;;
+        --skip-patch) SKIP_PATCH="true" ;;
         --erase)      ERASE_FLASH="true" ;;
         *) echo "Unknown arg: $arg" >&2; exit 2 ;;
     esac
@@ -79,6 +80,7 @@ if [[ "$SKIP_GIT" != "true" ]]; then
     fi
 fi
 
+if [[ "$SKIP_PATCH" != "true" ]]; then
 stage "2. Patch preview (dry-run)"
 python3 patch_ouis.py 2>&1 | head -60
 echo "  ..."
@@ -92,6 +94,7 @@ count=$(awk '/static const char\* mac_prefixes/,/^};/' src/raw/flockyou.cpp \
 echo "  patched OUI count: $count"
 [[ "$count" == "42" ]] || die "Expected 42 OUIs, got $count."
 echo "  $(c_green 'ok') OUI count verified"
+fi
 
 if [[ "$SKIP_BUILD" != "true" ]]; then
     stage "4. Build with PlatformIO"
