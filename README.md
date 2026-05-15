@@ -1,14 +1,64 @@
-# Flock-You GPS & Buzzer Fix Fork
+# Flock-You: oui-spy-flock-you-enhanced
 
-Fork of [colonelpanichacks/oui-spy-unified-blue](https://github.com/colonelpanichacks/oui-spy-unified-blue) with targeted fixes for **Flock-You mode (Mode 4)** — GPS lock loss during wardriving, WiFi dropout on Android, muffled buzzer audio, and added **RSSI distance estimation** with a configurable path-loss model.
+INTERACTIVE https://flockyou.netlify.app/
+
+🛰️ FLOCK-YOU: Open-source BLE wardriving for privacy auditing.
+Turn your ESP32-S3 into a "digital bird dog" that identifies, estimates distance, and logs the coordinates of Flock cameras and Raven sensors.
+
+# FLOCK-YOU
+> **The digital bird dog for your pocket.** Detect, geotag, and map hidden surveillance hardware in real-time.
+> [**View the Dashboard & Setup Guide →**](https://flockyou.netlify.app/)
+
+
+Fork of [colonelpanichacks/oui-spy-unified-blue](https://github.com/colonelpanichacks/oui-spy-unified-blue) with targeted fixes for **Flock-You mode (Mode 4)** — GPS lock loss during wardriving, WiFi dropout on Android, muffled buzzer audio, and added **RSSI distance estimation** with a configurable path-loss model. The Flock Safety BLE OUI detection list is also kept synced with the latest [nite-oui-collection](https://github.com/nitekry/nite-oui-collection) research.
 
 For full documentation on all four firmware modes (Detector, Foxhunter, Flock-You, Sky Spy), the boot selector, flashing with `flash.py`, hardware pinout, and the broader OUI-SPY ecosystem, see the **[original project README](https://github.com/colonelpanichacks/oui-spy-unified-blue)**.
 
-This fork changes a single file: **`src/raw/flockyou.cpp`**
+This fork's source changes are limited to a single file (**`src/raw/flockyou.cpp`**), plus two helper scripts at the repo root for managing OUI-list syncs and deployments: `patch_ouis.py` and `update_and_flash.sh`.
 
 ---
 
 ## What Changed
+
+### Flock Safety OUI List Sync (current: 42 prefixes)
+
+The BLE MAC-prefix detection list is synced with the latest research from @NitekryDPaul's [nite-oui-collection](https://github.com/nitekry/nite-oui-collection) plus Michael / DeFlockJoplin's drive-test additions. The list expanded from the original 20 prefixes to **42 active OUIs**, with three known-false-positive prefixes explicitly demoted.
+
+| Group | Count | Source |
+|---|---|---|
+| Original promiscuous-mode set | 29 | @NitekryDPaul |
+| April 2026 additions | 12 | @NitekryDPaul (nite-oui-collection) |
+| Joplin drive-test addition (`82:6b:f2`) | 1 | Michael / DeFlockJoplin |
+| **Net active prefixes** | **42** | |
+
+**Demoted prefixes (not in the active list):**
+
+| Prefix | Reason |
+|---|---|
+| `f8:a2:d6` | Hit on a Sony Media Player — false positive |
+| `cc:cc:cc` | No observed Flock hits — likely placeholder/test value |
+| `00:0c:e7` | Possible MediaTek false positive |
+
+**Known conflicts to expect:** `08:3a:88` has a BLE Ring doorbell collision and will produce occasional false positives in BLE-only mode. Cross-check with WiFi-side detection if available.
+
+**Full active OUI list** (case-insensitive substring match on the first 8 chars of each BLE MAC):
+
+```
+70:c9:4e  3c:91:80  d8:f3:bc  80:30:49  b8:35:32
+14:5a:fc  74:4c:a1  08:3a:88  9c:2f:9d  c0:35:32
+94:08:53  e4:aa:ea  f4:6a:dd  24:b2:b9  00:f4:8d
+d0:39:57  e8:d0:fc  e0:4f:43  b8:1e:a4  70:08:94
+58:8e:81  ec:1b:bd  3c:71:bf  58:00:e3  90:35:ea
+5c:93:a2  64:6e:69  48:27:ea  a4:cf:12  04:0d:84
+f0:82:c0  1c:34:f1  38:5b:44  94:34:69  b4:e3:f9
+b4:1e:52  14:b5:cd  94:2a:6f  f4:e2:c6  d4:11:d6
+e0:0a:f6  82:6b:f2
+```
+
+**Tooling for future syncs:**
+
+- `patch_ouis.py` — surgical Python script that locates the `mac_prefixes[]` array in `src/raw/flockyou.cpp`, writes a timestamped backup, and atomically replaces the array. Refuses to operate on a modified or already-patched file. Defaults to dry-run; pass `--apply` to commit.
+- `update_and_flash.sh` — interactive orchestrator that wraps the full pipeline: pull from origin → preview patch → apply patch → PlatformIO build → commit + push → port-detect and flash → optional serial monitor. Confirmation gate at every destructive stage. Skip flags: `--skip-git`, `--skip-patch`, `--skip-build`, `--skip-flash`.
 
 ### RSSI Distance Estimation
 
@@ -170,6 +220,9 @@ You're running the original firmware. Rebuild and reflash with `pio run -t uploa
 **PlatformIO flashes the wrong device:**
 Find the ESP32's port with `ls /dev/cu.usb*` and specify it: `pio run -t upload --upload-port /dev/cu.usbmodem1101`
 
+**Ring doorbell appearing as a Flock hit:**
+Expected — the `08:3a:88` OUI is on both. Cross-check the detection's BLE manufacturer ID (Flock advertises XUNTONG `0x09C8`); Ring devices won't.
+
 ---
 
 ## Building from Source
@@ -209,4 +262,6 @@ A clean boot shows:
 ## Credits
 
 - **[colonelpanichacks](https://github.com/colonelpanichacks)** — OUI-SPY Unified firmware and the Flock-You detection engine
+- **[NitekryDPaul](https://github.com/nitekry)** — Flock Safety OUI research and the [nite-oui-collection](https://github.com/nitekry/nite-oui-collection) dataset that powers the 42-prefix active list
+- **[DeFlockJoplin](https://github.com/DeflockJoplin)** — Joplin drive-test field validation, the `82:6b:f2` OUI contribution, and the wildcard-probe-request signature research
 - **[wgreenberg](https://github.com/wgreenberg)** — Flock Safety BLE manufacturer ID research ([flock-you](https://github.com/wgreenberg/flock-you))
