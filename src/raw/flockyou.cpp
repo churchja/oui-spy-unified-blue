@@ -98,6 +98,43 @@ static const char* mac_prefixes[] = {
     "82:6b:f2"
 };
 
+// MAC prefixes that are known to collide with non-Flock devices.
+// A MAC-prefix match on one of these OUIs is treated as a WEAK signal
+// and only counts as a detection if corroborated by device name,
+// manufacturer ID, or Raven UUID on the same advertisement.
+//
+//   08:3a:88 — shared with BLE Ring doorbells (and HP devices)
+static const char* conflict_prefixes[] = {
+    "08:3a:88"
+};
+
+// Name patterns that, when seen on a conflict-OUI device, indicate
+// a known false-positive product. If a conflict-OUI advertisement
+// also carries one of these names, it is discarded outright — no
+// detection is recorded even if other methods would otherwise fire.
+//
+//   "DBC" — Ring doorbells advertise as "DBC350_xx:xx:xx" etc.
+static const char* conflict_name_blocklist[] = {
+    "DBC"
+};
+
+static bool isConflictPrefix(const uint8_t* mac) {
+    char mac_str[9];
+    snprintf(mac_str, sizeof(mac_str), "%02x:%02x:%02x", mac[0], mac[1], mac[2]);
+    for (size_t i = 0; i < sizeof(conflict_prefixes)/sizeof(conflict_prefixes[0]); i++) {
+        if (strncasecmp(mac_str, conflict_prefixes[i], 8) == 0) return true;
+    }
+    return false;
+}
+
+static bool isBlocklistedName(const char* name) {
+    if (!name || !name[0]) return false;
+    for (size_t i = 0; i < sizeof(conflict_name_blocklist)/sizeof(conflict_name_blocklist[0]); i++) {
+        if (strcasestr(name, conflict_name_blocklist[i])) return true;
+    }
+    return false;
+}
+
 // BLE device name patterns (matched case-insensitive substring)
 static const char* device_name_patterns[] = {
     "FS Ext Battery",
@@ -591,16 +628,35 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
         bool isRaven = false;
         const char* ravenFW = "";
 
+        // Conflict-OUI false-positive suppression:
+        //   - A MAC-prefix hit on a conflict OUI (e.g. 08:3a:88) is held as
+        //     a WEAK match. It only counts if a stronger signal also fires.
+        //   - If the device's name matches a known false-positive pattern
+        //     (e.g. "DBC*" for Ring), the advertisement is discarded
+        //     outright, no matter what other methods would match.
+        bool conflictOUI = false;
+        bool weakMacMatch = false;
+
         // 1. Check MAC prefix against known Flock Safety OUIs
         if (checkMACPrefix(mac)) {
-            detected = true;
-            method = "mac_prefix";
+            conflictOUI = isConflictPrefix(mac);
+            // Short-circuit: blocklisted name on a conflict OUI is a hard reject
+            if (conflictOUI && !name.empty() && isBlocklistedName(name.c_str())) {
+                return;  // Known false positive — don't process further
+            }
+            if (conflictOUI) {
+                weakMacMatch = true;  // Held pending corroboration
+            } else {
+                detected = true;
+                method = "mac_prefix";
+            }
         }
 
         // 2. Check BLE device name patterns
         if (!detected && !name.empty() && checkDeviceName(name.c_str())) {
             detected = true;
-            method = "device_name";
+            method = weakMacMatch ? "mac_prefix+name" : "device_name";
+            weakMacMatch = false;  // Corroborated
         }
 
         // 3. Check BLE manufacturer company IDs (from wgreenberg/flock-you)
@@ -612,7 +668,8 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
                                      (uint16_t)(uint8_t)data[0];
                     if (checkManufacturerID(code)) {
                         detected = true;
-                        method = "ble_mfr_id";
+                        method = weakMacMatch ? "mac_prefix+mfr" : "ble_mfr_id";
+                        weakMacMatch = false;  // Corroborated
                         break;
                     }
                 }
@@ -624,11 +681,16 @@ class FYBLECallbacks : public NimBLEAdvertisedDeviceCallbacks {
             char detUUID[41] = {0};
             if (checkRavenUUID(dev, detUUID)) {
                 detected = true;
-                method = "raven_uuid";
+                method = weakMacMatch ? "mac_prefix+uuid" : "raven_uuid";
+                weakMacMatch = false;  // Corroborated
                 isRaven = true;
                 ravenFW = estimateRavenFW(dev);
             }
         }
+
+        // If we get here with weakMacMatch still set, no other method fired.
+        // Suppress the detection — lone conflict-OUI hits are not counted.
+        // (detected stays false, so the block below is skipped.)
 
         if (detected) {
             int idx = fyAddDetection(addrStr.c_str(), name.c_str(), rssi,
