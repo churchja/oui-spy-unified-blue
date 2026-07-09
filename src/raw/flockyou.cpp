@@ -84,9 +84,13 @@
 //   - f8:a2:d6 → hit on a Sony Media Player, marked Removed
 //   - cc:cc:cc → no observed hits, marked Removed
 //   - 00:0c:e7 → possible MediaTek false positive, marked Removed
+//   - 94:2a:6f → "Nope - Ubiquiti", @NitekryDPaul Jun 2026 my_tested_flock.md
+//   - f4:e2:c6 → "Nope - Ubiquiti", @NitekryDPaul Jun 2026 my_tested_flock.md
 // Notes on flagged entries (still tracked):
 //   - 08:3a:88 has a known BLE Ring conflict; expect occasional
 //     Ring-doorbell false positives in BLE mode.
+//   - 48:27:ea, a4:cf:12 are low-confidence WiGLE crowdsource entries
+//     (Espressif plausible Flock variants); kept per upstream main.cpp.
 static const char* mac_prefixes[] = {
     // @NitekryDPaul original promiscuous-mode set (29 OUIs)
     "70:c9:4e", "3c:91:80", "d8:f3:bc", "80:30:49", "b8:35:32",
@@ -95,12 +99,17 @@ static const char* mac_prefixes[] = {
     "d0:39:57", "e8:d0:fc", "e0:4f:43", "b8:1e:a4", "70:08:94",
     "58:8e:81", "ec:1b:bd", "3c:71:bf", "58:00:e3", "90:35:ea",
     "5c:93:a2", "64:6e:69", "48:27:ea", "a4:cf:12",
-    // @NitekryDPaul April 2026 additions (nite-oui-collection)
+    // @NitekryDPaul April 2026 additions (nite-oui-collection), 10 OUIs
     "04:0d:84", "f0:82:c0", "1c:34:f1", "38:5b:44", "94:34:69",
-    "b4:e3:f9", "b4:1e:52", "14:b5:cd", "94:2a:6f", "f4:e2:c6",
+    "b4:e3:f9", "b4:1e:52", "14:b5:cd",
     "d4:11:d6", "e0:0a:f6",
     // Michael / DeFlockJoplin — drive-test in Joplin
-    "82:6b:f2"
+    "82:6b:f2",
+    // Flock Safety BLE OUIs from @NitekryDPaul's July 2026 groups/le/
+    // privacy_invaders_ouis_law_enforcement.csv addition. Distinct from
+    // the WiFi promiscuous-mode set above — these are BLE-side prefixes
+    // specifically catalogued for law-enforcement device detection.
+    "00:40:8c", "ac:cc:8e"
 };
 
 // BLE device name patterns (matched case-insensitive substring)

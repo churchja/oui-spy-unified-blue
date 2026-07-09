@@ -42,7 +42,7 @@ This is a port of the `promiscious` branch of `flock-you` — see that repo for 
 
 **Detection methods (WiFi only):**
 
-- **addr2 OUI match** — transmitter-side match against the 41-OUI Flock Safety list (29 from @NitekryDPaul's original promiscuous-mode set, 12 from his April 2026 additions). All work of **OrdoOuroborous / [@NitekryDPaul](https://github.com/nitekry)**.
+- **addr2 OUI match** — transmitter-side match against the 39-OUI Flock Safety list (29 from @NitekryDPaul's original promiscuous-mode set, 10 from his April 2026 additions — two of the original 12 April adds, `94:2a:6f` and `f4:e2:c6`, were demoted as Ubiquiti false positives per his June 2026 update). All work of **OrdoOuroborous / [@NitekryDPaul](https://github.com/nitekry)**.
 - **addr1 OUI match** — the receiver-side technique: catches Flock STAs that appear only as the destination of probe responses or data frames during their burst-sleep windows. Mandatory multicast + locally-administered guards before the match. @NitekryDPaul's discovery.
 - **Wildcard probe signature** — Probe Request (type=0 subtype=4) + zero-length SSID IE + known-OUI addr2. The DeFlockJoplin high-precision signature (Joplin drive-test: 11/12 cameras caught with 2 false positives). Suppresses the broad addr2 alert on the same frame to avoid double-counting.
 
@@ -77,7 +77,7 @@ Detects Flock Safety surveillance cameras, Raven gunshot detectors, and related 
 
 **Detection methods:**
 
-- **MAC prefix matching** — 42 known Flock Safety OUI prefixes sourced from **OrdoOuroborous / [@NitekryDPaul](https://github.com/nitekry)**'s [nite-oui-collection](https://github.com/nitekry/nite-oui-collection) (41) plus Michael / DeFlockJoplin's drive-test addition `82:6b:f2` (1). All research credit to @NitekryDPaul for the underlying promiscuous-mode work; this firmware just consumes his list.
+- **MAC prefix matching** — 42 known Flock Safety MAC prefixes: 39 from **OrdoOuroborous / [@NitekryDPaul](https://github.com/nitekry)**'s [nite-oui-collection](https://github.com/nitekry/nite-oui-collection) promiscuous-mode set (`94:2a:6f` and `f4:e2:c6` demoted in his June 2026 update as Ubiquiti false positives), Michael / DeFlockJoplin's drive-test addition `82:6b:f2` (1), and Flock Safety BLE OUIs `00:40:8c` / `ac:cc:8e` (2) from @NitekryDPaul's July 2026 `groups/le/privacy_invaders_ouis_law_enforcement.csv` addition. All research credit to @NitekryDPaul.
 - **BLE device name patterns** — case-insensitive substring matching for `FS Ext Battery`, `Penguin`, `Flock`, `Pigvision`
 - **BLE manufacturer company ID** — `0x09C8` (XUNTONG), associated with Flock Safety hardware. Catches devices even when no name is broadcast. *Sourced from [wgreenberg/flock-you](https://github.com/wgreenberg/flock-you).*
 - **Raven service UUID matching** — identifies Raven gunshot detection units by their BLE GATT service UUIDs (device info, GPS, power, network, upload, error, legacy health/location services)
