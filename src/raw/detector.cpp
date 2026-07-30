@@ -618,12 +618,14 @@ static const PresetEntry PRESET_RAYBAN[] = {
 static const size_t PRESET_RAYBAN_COUNT = sizeof(PRESET_RAYBAN) / sizeof(PRESET_RAYBAN[0]);
 
 // Axon body cameras (Body 3/4, Fleet dash, Taser 7/10).
-// No Axon/TASER OUI is registered with IEEE, so MAC-prefix detection is
-// not possible — company ID + service UUID are the only paths. Both are
-// uniquely attributable at the Bluetooth SIG level.
+// Uses all three signal types: dedicated IEEE OUI 00:25:DF ("Axon
+// Enterprise, Inc."), Bluetooth SIG company ID 0x034D ("TASER
+// International, Inc." — Axon's earlier registered name), and service
+// UUID 0xFC81 ("Axon Enterprise, Inc."). All three uniquely attributable.
 static const PresetEntry PRESET_AXON[] = {
-    { FT_COMPANY_ID,      "034D", "TASER International CID (Axon body cams)" },
-    { FT_SERVICE_UUID_16, "FC81", "Axon Enterprise service UUID" },
+    { FT_MAC_PREFIX,      "0025DF", "Axon Enterprise OUI (IEEE)" },
+    { FT_COMPANY_ID,      "034D",   "TASER International CID (Axon body cams)" },
+    { FT_SERVICE_UUID_16, "FC81",   "Axon Enterprise service UUID" },
 };
 static const size_t PRESET_AXON_COUNT = sizeof(PRESET_AXON) / sizeof(PRESET_AXON[0]);
 
