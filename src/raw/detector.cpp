@@ -1421,7 +1421,7 @@ DD:EE:FF:ab:cd:ef
                         <li>Removes web interface access</li>
                     </ul>
                     <p style="line-height: 1.4; margin: 0; color: #ffcccc; font-size: 12px;">
-                        <strong>Unlock:</strong> USB connection, flash erase, then firmware reflash required
+                        <strong>Unlock:</strong> hold the BOOT button during power-on (or erase flash + reflash)
                     </p>
                 </div>
                 
@@ -1442,7 +1442,7 @@ DD:EE:FF:ab:cd:ef
                         Lock Configuration Permanently
                     </button>
                     <p style="font-size: 11px; color: #888888; margin-top: 12px; font-style: italic;">
-                        Cannot be undone without flash erase + reflash
+                        Undo by holding BOOT during power-on
                     </p>
                 </div>
             </div>
@@ -1859,7 +1859,7 @@ DD:EE:FF:ab:cd:ef
             }
             
             function burnInConfig() {
-                if (!confirm('PERMANENT CONFIGURATION LOCK\n\nThis will PERMANENTLY lock all settings (OUI/MAC filters, aliases, buzzer/LED preferences).\n\nAfter activation:\n- WiFi AP and config window disabled on boot\n- Device boots directly to scanning mode\n- Unlock requires: flash erase + firmware reflash via USB\n\nClick OK to proceed with permanent lock.')) {
+                if (!confirm('PERMANENT CONFIGURATION LOCK\n\nThis will PERMANENTLY lock all settings (OUI/MAC filters, aliases, buzzer/LED preferences).\n\nAfter activation:\n- WiFi AP and config window disabled on boot\n- Device boots directly to scanning mode\n- Unlock: hold BOOT during power-on (or erase flash + reflash)\n\nClick OK to proceed with permanent lock.')) {
                     return;
                 }
                 
@@ -2501,7 +2501,7 @@ void startConfigMode() {
         if (isSerialConnected()) {
             Serial.println("Configuration locked successfully!");
             Serial.println("Device will skip config mode on next boot");
-            Serial.println("Reflash firmware to unlock");
+            Serial.println("Unlock: hold BOOT at power-on, or erase flash + reflash");
         }
         
         String responseHTML = R"html(
@@ -2598,7 +2598,7 @@ void startConfigMode() {
         </div>
         <div class="warning">
             <p style="font-weight: 600; margin-top: 0; font-size: 16px; text-transform: uppercase;">Unlock Procedure:</p>
-            <p style="margin-bottom: 0;">USB connection required. Must erase flash storage, then reflash firmware to restore configuration access</p>
+            <p style="margin-bottom: 0;">To restore configuration access: power-cycle the device holding the BOOT button for 1.5s. Erasing flash also works.</p>
         </div>
         <p class="countdown">Device will restart and begin scanning in 3 seconds...</p>
         <script>
@@ -2936,12 +2936,53 @@ void setup() {
     preferences.begin("ouispy", true);
     bool configLocked = preferences.getBool("configLocked", false);
     preferences.end();
+
+    // BOOT-button escape hatch. Burn-in is otherwise irreversible: config
+    // mode never comes back, so there is no way to reach the dashboard and
+    // no way to undo it short of erasing flash. Holding BOOT (GPIO0) for
+    // 1.5s during power-on clears the lock. Beeps while counting so the
+    // hold is obviously registering; releasing early aborts.
+    if (configLocked) {
+        pinMode(0, INPUT_PULLUP);
+        delay(50);
+        if (digitalRead(0) == LOW) {
+            Serial.println("BOOT held - keep holding 1.5s to clear config lock...");
+            unsigned long t0 = millis();
+            bool held = true;
+            while (millis() - t0 < 1500) {
+                if (digitalRead(0) == HIGH) { held = false; break; }
+                if ((millis() - t0) % 300 < 40) {
+                    ledcSetup(0, 2000, 8);
+                    ledcAttachPin(BUZZER_PIN, 0);
+                    ledcWrite(0, 90);
+                    delay(30);
+                    ledcWrite(0, 0);
+                }
+                delay(10);
+            }
+            if (held) {
+                preferences.begin("ouispy", false);
+                preferences.remove("configLocked");
+                preferences.end();
+                configLocked = false;
+                Serial.println("*** CONFIG LOCK CLEARED - entering config mode ***");
+                for (int i = 0; i < 3; i++) {   // triple beep = unlocked
+                    ledcSetup(0, 3000, 8);
+                    ledcAttachPin(BUZZER_PIN, 0);
+                    ledcWrite(0, 110); delay(80);
+                    ledcWrite(0, 0);   delay(60);
+                }
+            } else {
+                Serial.println("BOOT released early - lock unchanged");
+            }
+        }
+    }
     
     if (configLocked) {
         Serial.println("======================================");
         Serial.println("CONFIGURATION LOCKED (BURNED IN)");
         Serial.println("Skipping config mode - going straight to scanning");
-        Serial.println("To enable config mode: reflash firmware");
+        Serial.println("To unlock: hold BOOT during power-on (or erase flash)");
         Serial.println("======================================");
         
         // Start scanning immediately
