@@ -153,7 +153,7 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 <button class="sb" onclick="saveAP()">SET</button>
 <label class="bz"><input type="checkbox" id="bz" onchange="saveBZ(this.checked)" %BUZZER%>BZR</label>
 </div>
-<div class="f" id="ft">Hold BOOT 2s for menu &bull; MAC randomized</div>
+<div class="f" id="ft">Hold BOOT 1.5s for menu &bull; MAC randomized</div>
 </div>
 <div id="y" class="boot" style="display:none">
 <div class="bt" id="yt"></div>

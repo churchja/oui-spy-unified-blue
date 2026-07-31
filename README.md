@@ -20,10 +20,35 @@ On first boot, connect to the selector AP to pick a firmware mode:
 
 BLE alert tool that continuously scans for specific target devices by OUI prefix, MAC address, and device name patterns. When a match is found, the device triggers audible and visual alerts. Configurable target lists via web interface.
 
-- AP: `snoopuntothem`
-- Scans BLE advertisements against user-configured MAC/OUI watchlists
+- AP: `snoopuntothem` / `astheysnoopuntous`
+- Scans BLE advertisements against user-configured watchlists
 - NeoPixel + buzzer feedback on detection
 - Web dashboard for managing targets and viewing scan results
+
+**Five signature classes.** OUI prefix and full MAC are typed into the config
+boxes. Company ID, 16-bit service UUID, and device-name substring cannot be
+expressed as text and are installed from the OUI Database.
+
+**OUI Database.** A browsable list of known surveillance hardware — RING,
+AXON, FLOCK SAFETY, DJI, PARROT, SKYDIO, META/RAYBAN — each with prefixes,
+category, and typical devices. AXON and META/RAYBAN carry more than OUIs, so
+their button reads **+ Add all signatures**:
+
+| Vendor | Signatures |
+|---|---|
+| **AXON** | OUI `00:25:DF`, company ID `0x034D` (TASER International), service UUID `0xFC81` |
+| **META/RAYBAN** | 5 OUIs, company ID `0x0D53` (Luxottica), service UUID `0xFD5F`, names `Ray-Ban` / `Wayfarer` / `Oakley Meta` |
+
+OUIs alone are the weakest signal for both — Meta glasses rotate their MAC,
+and Axon hardware may never expose its OUI in an advertisement. The Luxottica
+company ID is also what separates Ray-Ban glasses from Quest headsets, which
+share Meta's own IDs. Each added vendor renders one colour-coded line under
+the OUI box with an `x` to remove. Manual OUI entry is unaffected.
+
+**Burn-in is reversible.** Locking the config disables the AP permanently, but
+holding BOOT during power-on clears the lock and restores config mode. Older
+firmware claimed a reflash would unlock it — it does not, NVS survives a
+reflash.
 
 ### Mode 2: Foxhunter
 
@@ -146,7 +171,7 @@ Each mode creates its own AP. When switching modes, **your phone/laptop will aut
 |-----|----------|
 | GPIO 3 | Piezo buzzer |
 | GPIO 21 | NeoPixel LED |
-| GPIO 0 | BOOT button (hold 2s to return to mode selector) |
+| GPIO 0 | BOOT button (hold 1.5s to return to mode selector) |
 
 ---
 
@@ -154,7 +179,7 @@ Each mode creates its own AP. When switching modes, **your phone/laptop will aut
 
 On power-up, the device starts a WiFi access point (`oui-spy` / `ouispy123` by default) and serves a firmware selector at `192.168.4.1`. Pick a mode, the device stores the selection in NVS, and reboots into it.
 
-- **Return to menu:** Hold the BOOT button for 2 seconds at any time
+- **Return to menu:** Hold the BOOT button for 1.5 seconds at any time
 - **AP credentials:** Configurable SSID and password from the selector page, stored in NVS
 - **Buzzer toggle:** Enable/disable the boot buzzer globally from the selector menu
 - **MAC randomization:** Device MAC is randomized on every boot
