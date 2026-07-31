@@ -656,6 +656,41 @@ int applyPreset(const PresetEntry* preset, size_t count, const char* labelPrefix
     return added;
 }
 
+// Remove the non-MAC signatures a preset installed. MAC prefixes are left
+// alone — those live in the OUI textarea and are the user's to manage.
+int removePreset(const PresetEntry* preset, size_t count) {
+    int removed = 0;
+    for (size_t i = 0; i < count; i++) {
+        const PresetEntry& p = preset[i];
+        if (p.type == FT_MAC_PREFIX || p.type == FT_FULL_MAC) continue;
+        for (size_t j = 0; j < targetFilters.size(); ) {
+            if (targetFilters[j].type == p.type &&
+                targetFilters[j].identifier.equalsIgnoreCase(p.identifier)) {
+                targetFilters.erase(targetFilters.begin() + j);
+                removed++;
+            } else {
+                j++;
+            }
+        }
+    }
+    if (removed > 0) saveConfiguration();
+    return removed;
+}
+
+// True if any of the preset's non-MAC signatures are currently installed.
+// MAC prefixes are excluded on purpose: those live in the OUI textarea and
+// may have been added manually, so they don't indicate preset state.
+bool presetInstalled(const PresetEntry* preset, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        const PresetEntry& p = preset[i];
+        if (p.type == FT_MAC_PREFIX || p.type == FT_FULL_MAC) continue;
+        for (const TargetFilter& f : targetFilters) {
+            if (f.type == p.type && f.identifier.equalsIgnoreCase(p.identifier)) return true;
+        }
+    }
+    return false;
+}
+
 // ================================
 // Device Alias Functions
 // ================================
@@ -1178,7 +1213,29 @@ const char* getConfigHTML() {
             color: #ffffff;
             border: 1px solid rgba(255, 20, 147, 0.2);
         }
-    </style>
+            .oui-add-btn { background: linear-gradient(135deg, #10b981 0%%, #059669 100%%) !important; font-size: 13px !important; padding: 8px 16px !important; margin: 8px 0 !important; width: 100%%; }
+        .sig-lines { margin-top: 12px; }
+        .sig-line {
+            display: flex; align-items: center; flex-wrap: wrap; gap: 6px;
+            padding: 8px 10px; margin-bottom: 6px;
+            background: rgba(255,255,255,0.03);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 8px; font-size: 12px;
+            font-family: 'SFMono-Regular', Consolas, monospace;
+        }
+        .sig-vendor { font-weight: 700; color: #ffffff; margin-right: 4px;
+                      font-family: 'Segoe UI', sans-serif; }
+        .sig-mac  { color: #4dd0e1; }
+        .sig-cid  { color: #ffb74d; }
+        .sig-uuid { color: #81c784; }
+        .sig-name { color: #ba9ffb; }
+        .sig-sep  { color: #6b6b7d; }
+        .sig-rm {
+            margin-left: auto; background: none; border: none;
+            color: #ff6b6b; cursor: pointer; font-size: 14px;
+            padding: 0 4px; line-height: 1;
+        }
+        </style>
 </head>
 <body>
     <div class="ascii-background">%ASCII_ART%</div>
@@ -1191,27 +1248,6 @@ const char* getConfigHTML() {
 
         <form id="configForm" method="POST" action="/save">
             <div class="section">
-                <h3>Detection Presets</h3>
-                <div class="help-text" style="margin-bottom: 12px;">
-                    One-click bundles that add every known signal for a device family — MAC prefixes, BLE company IDs, service UUIDs, and name patterns. Clicking is safe; duplicates are skipped. Presets install to persistent storage immediately (no Save required).
-                </div>
-                <div style="display: flex; gap: 12px; flex-wrap: wrap;">
-                    <button type="button" onclick="applyPreset('rayban', 'Ray-Ban / Oakley Meta smart glasses')"
-                            style="background: linear-gradient(135deg, #4b1e5f 0%, #6b2a86 100%); color: #fff; padding: 12px 20px; font-size: 14px; font-weight: 600; border: 1px solid #8a3fb0; border-radius: 6px; cursor: pointer;">
-                        Add Ray-Ban / Oakley Meta
-                    </button>
-                    <button type="button" onclick="applyPreset('axon', 'Axon body cam / Taser')"
-                            style="background: linear-gradient(135deg, #1c3e5a 0%, #285883 100%); color: #fff; padding: 12px 20px; font-size: 14px; font-weight: 600; border: 1px solid #4a7ba8; border-radius: 6px; cursor: pointer;">
-                        Add Axon body cam
-                    </button>
-                </div>
-                <div id="presetStatus" style="margin-top: 10px; font-size: 13px; color: #aaddff; min-height: 18px;"></div>
-                <div class="help-text" style="margin-top: 8px; font-size: 11px; opacity: 0.75;">
-                    Signatures cross-verified against Bluetooth SIG assigned-numbers, IEEE OUI registry, and community project <a href="https://github.com/lnxgod/friendorfoe" style="color: #aaddff;" target="_blank">lnxgod/friendorfoe</a>.
-                </div>
-            </div>
-
-            <div class="section">
                 <h3>OUI Prefixes</h3>
                 <textarea id="ouis" name="ouis" placeholder="Enter OUI prefixes, one per line:
 AA:BB:CC
@@ -1221,8 +1257,78 @@ DD:EE:FF
                     OUI prefixes (first 3 bytes) match all devices from a manufacturer.<br>
                     Format: XX:XX:XX (8 characters with colons)
                 </div>
+                <div id="sigLines" class="sig-lines"></div>
             </div>
             
+            <div class="section">
+                <h3>OUI Database</h3>
+                <div class="help-text" style="margin-bottom: 15px;">
+                    Browse known surveillance device OUI prefixes by manufacturer. Click <strong>"+ Add"</strong> to append them to your filter list above.
+                </div>
+                <div class="oui-db">
+                    <!-- OUI_DB_START -->
+                    <details>
+                    <summary><b>RING</b> <code>11 OUIs</code></summary>
+                    <div class="oui-entries"><code>18:7F:88</code> <code>24:2B:D6</code> <code>34:3E:A4</code> <code>54:E0:19</code> <code>5C:47:5E</code> <code>64:9A:63</code> <code>90:48:6C</code> <code>9C:76:13</code> <code>AC:9F:C3</code> <code>C4:DB:AD</code> <code>CC:3B:FB</code></div>
+                    <button type="button" class="oui-add-btn" onclick="appendOUIs('18:7F:88,24:2B:D6,34:3E:A4,54:E0:19,5C:47:5E,64:9A:63,90:48:6C,9C:76:13,AC:9F:C3,C4:DB:AD,CC:3B:FB')">+ Add to filter list</button>
+                    <div class="oui-meta"><strong>Category:</strong> Doorbell/Security Camera</div>
+                    <div class="oui-meta"><strong>Detection Range:</strong> Typical WiFi/BLE range</div>
+                    <div class="oui-meta"><strong>Common Devices:</strong> Ring Doorbell, Ring Camera, Ring Chime</div>
+                    </details>
+                    <details>
+                    <summary><b>AXON</b> <code>1 OUI</code></summary>
+                    <div class="oui-entries"><code>00:25:DF</code> <code>CID 0x034D</code> <code>UUID 0xFC81</code></div>
+                    <button type="button" class="oui-add-btn" onclick="addVendor('axon','AXON','00:25:DF')">+ Add all signatures</button>
+                    <div class="oui-meta"><strong>Category:</strong> Body Camera / Law Enforcement</div>
+                    <div class="oui-meta"><strong>Detection Range:</strong> Short-range BLE/WiFi</div>
+                    <div class="oui-meta"><strong>Common Devices:</strong> Axon Body Camera, Axon Fleet</div>
+                    </details>
+                    <details>
+                    <summary><b>FLOCK SAFETY</b> <code>1 OUI</code></summary>
+                    <div class="oui-entries"><code>B4:1E:52</code></div>
+                    <button type="button" class="oui-add-btn" onclick="appendOUIs('B4:1E:52')">+ Add to filter list</button>
+                    <div class="oui-meta"><strong>Category:</strong> Automated License Plate Reader (ALPR) / Security Camera</div>
+                    <div class="oui-meta"><strong>Detection Range:</strong> WiFi/Cellular</div>
+                    <div class="oui-meta"><strong>Common Devices:</strong> Flock Safety Camera, Falcon Camera, Raven Camera</div>
+                    </details>
+                    <details>
+                    <summary><b>DJI</b> <code>8 OUIs</code></summary>
+                    <div class="oui-entries"><code>0C:9A:E6</code> <code>8C:58:23</code> <code>04:A8:5A</code> <code>58:B8:58</code> <code>E4:7A:2C</code> <code>60:60:1F</code> <code>48:1C:B9</code> <code>34:D2:62</code></div>
+                    <button type="button" class="oui-add-btn" onclick="appendOUIs('0C:9A:E6,8C:58:23,04:A8:5A,58:B8:58,E4:7A:2C,60:60:1F,48:1C:B9,34:D2:62')">+ Add to filter list</button>
+                    <div class="oui-meta"><strong>Category:</strong> Consumer & Commercial Drones</div>
+                    <div class="oui-meta"><strong>Detection Range:</strong> WiFi/OcuSync up to several km</div>
+                    <div class="oui-meta"><strong>Common Devices:</strong> Mavic, Phantom, Inspire, Mini series</div>
+                    </details>
+                    <details>
+                    <summary><b>PARROT</b> <code>5 OUIs</code></summary>
+                    <div class="oui-entries"><code>00:12:1C</code> <code>00:26:7E</code> <code>90:03:B7</code> <code>90:3A:E6</code> <code>A0:14:3D</code></div>
+                    <button type="button" class="oui-add-btn" onclick="appendOUIs('00:12:1C,00:26:7E,90:03:B7,90:3A:E6,A0:14:3D')">+ Add to filter list</button>
+                    <div class="oui-meta"><strong>Category:</strong> Consumer & Commercial Drones</div>
+                    <div class="oui-meta"><strong>Detection Range:</strong> WiFi/BLE range</div>
+                    <div class="oui-meta"><strong>Common Devices:</strong> Parrot Anafi, Parrot Bebop, Parrot AR.Drone</div>
+                    </details>
+                    <details>
+                    <summary><b>SKYDIO</b> <code>1 OUI</code></summary>
+                    <div class="oui-entries"><code>38:1D:14</code></div>
+                    <button type="button" class="oui-add-btn" onclick="appendOUIs('38:1D:14')">+ Add to filter list</button>
+                    <div class="oui-meta"><strong>Category:</strong> Commercial & Enterprise Drones</div>
+                    <div class="oui-meta"><strong>Detection Range:</strong> WiFi range</div>
+                    <div class="oui-meta"><strong>Common Devices:</strong> Skydio 2, Skydio X2, Skydio 3</div>
+                    </details>
+                    <details>
+                    <summary><b>META/RAYBAN SMARTGLASSES</b> <code>5 OUIs</code></summary>
+                    <div class="oui-note"><em>sourced from <a href=\"https://github.com/sh4d0wm45k/glass-detect/blob/main/glass-detect/glass-detect.ino#L21\" target=\"_blank\" style=\"color:#4ecdc4;\">glass-detect repository</a></em></div>
+                    <div class="oui-note">Last one from Luxottica Group S.P.A. detected by @konradit.</div>
+                    <div class="oui-entries"><code>7C:2A:9E</code> <code>CC:66:0A</code> <code>F4:03:43</code> <code>5C:E9:1E</code> <code>98:59:49</code> <code>CID 0x0D53</code> <code>UUID 0xFD5F</code> <code>name "Ray-Ban"</code></div>
+                    <button type="button" class="oui-add-btn" onclick="addVendor('rayban','META/RAYBAN','7C:2A:9E,CC:66:0A,F4:03:43,5C:E9:1E,98:59:49')">+ Add all signatures</button>
+                    <div class="oui-meta"><strong>Category:</strong> Smartglasses</div>
+                    <div class="oui-meta"><strong>Detection Range:</strong> WiFi/BLE range</div>
+                    <div class="oui-meta"><strong>Common Devices:</strong> Meta/Ray-Ban Smartglasses</div>
+                    </details>
+                    <!-- OUI_DB_END -->
+                </div>
+            </div>
+
             <div class="section">
                 <h3>MAC Addresses</h3>
                 <textarea id="macs" name="macs" placeholder="Enter full MAC addresses, one per line:
@@ -1617,6 +1723,103 @@ DD:EE:FF:ab:cd:ef
                     statusEl.style.color = '#ff7777';
                     statusEl.textContent = 'Preset request failed: ' + err;
                 });
+            }
+
+            var VENDOR_OUIS = {
+                axon:   '00:25:DF',
+                rayban: '7C:2A:9E,CC:66:0A,F4:03:43,5C:E9:1E,98:59:49'
+            };
+            var VENDOR_LABELS = { axon: 'AXON', rayban: 'META/RAYBAN' };
+
+            // Repopulate the signature lines on page load. Without this the
+            // filters stay installed in NVS but the UI looks empty after a
+            // refresh, which reads as "my presets vanished".
+            function loadSigLines() {
+                fetch('/api/presets/status')
+                    .then(function(r){ return r.json(); })
+                    .then(function(d){
+                        Object.keys(VENDOR_LABELS).forEach(function(k){
+                            if (d && d[k]) renderSigLine(k, VENDOR_LABELS[k], VENDOR_OUIS[k], null);
+                        });
+                    })
+                    .catch(function(){ /* device offline: leave lines empty */ });
+            }
+
+            var VENDOR_SIGS = {
+                axon:   [ {t:'cid',  v:'0x034D', l:'CID'},
+                          {t:'uuid', v:'0xFC81', l:'UUID'} ],
+                rayban: [ {t:'cid',  v:'0x0D53', l:'CID'},
+                          {t:'uuid', v:'0xFD5F', l:'UUID'},
+                          {t:'name', v:'Ray-Ban',    l:'name'},
+                          {t:'name', v:'Wayfarer',   l:'name'},
+                          {t:'name', v:'Oakley Meta',l:'name'} ]
+            };
+
+            function addVendor(preset, label, ouiStr) {
+                if (ouiStr) appendOUIs(ouiStr);          // manual box still authoritative for MACs
+                fetch('/api/presets/apply', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/x-www-form-urlencoded'},
+                    body: 'name=' + encodeURIComponent(preset)
+                })
+                .then(function(r){ return r.json(); })
+                .then(function(d){
+                    renderSigLine(preset, label, ouiStr, d && d.ok ? null : (d && d.error) || 'failed');
+                })
+                .catch(function(e){ renderSigLine(preset, label, ouiStr, String(e)); });
+            }
+
+            function renderSigLine(preset, label, ouiStr, err) {
+                var box = document.getElementById('sigLines');
+                if (!box) return;
+                var existing = document.getElementById('sig-' + preset);
+                if (existing) existing.remove();
+
+                var parts = [];
+                (ouiStr ? ouiStr.split(',') : []).forEach(function(o){
+                    parts.push('<span class="sig-mac">' + o.trim() + '</span>');
+                });
+                (VENDOR_SIGS[preset] || []).forEach(function(sig){
+                    parts.push('<span class="sig-' + sig.t + '">' + sig.l + ' ' + sig.v + '</span>');
+                });
+
+                var row = document.createElement('div');
+                row.className = 'sig-line';
+                row.id = 'sig-' + preset;
+                row.innerHTML =
+                    '<span class="sig-vendor">' + label + '</span>' +
+                    parts.join('<span class="sig-sep">,</span> ') +
+                    (err ? ' <span style="color:#ff6b6b">(' + err + ')</span>' : '') +
+                    '<button type="button" class="sig-rm" title="Remove signatures" ' +
+                        'onclick="removeVendor(\'' + preset + '\')">&times;</button>';
+                box.appendChild(row);
+            }
+
+            function removeVendor(preset) {
+                fetch('/api/presets/remove', {
+                    method: 'POST',
+                    headers: {'Content-Type':'application/x-www-form-urlencoded'},
+                    body: 'name=' + encodeURIComponent(preset)
+                }).then(function(){
+                    var el = document.getElementById('sig-' + preset);
+                    if (el) el.remove();
+                });
+            }
+
+            function appendOUIs(ouiStr) {
+                var ta = document.getElementById('ouis');
+                var current = ta.value.trim();
+                var existing = current ? current.split('\n').map(function(s){return s.trim();}).filter(Boolean) : [];
+                var toAdd = ouiStr.split(',').map(function(s){return s.trim();}).filter(Boolean);
+                var added = 0;
+                toAdd.forEach(function(oui) {
+                    if (existing.indexOf(oui) === -1) { existing.push(oui); added++; }
+                });
+                ta.value = existing.join('\n');
+                ta.style.borderColor = '#10b981';
+                ta.style.boxShadow = '0 0 0 3px rgba(16,185,129,0.3)';
+                setTimeout(function(){ ta.style.borderColor = ''; ta.style.boxShadow = ''; }, 1500);
+                ta.scrollIntoView({behavior:'smooth',block:'center'});
             }
 
             function clearConfig() {
@@ -2155,7 +2358,16 @@ void startConfigMode() {
         }
         
         // Process and save current form values (same logic as /save endpoint)
-        targetFilters.clear();
+        // Only drop the MAC/OUI-backed filters — those are the ones the
+        // textareas own. Preset-installed filters (company ID, service UUID,
+        // name substring) have no textarea representation, so clearing the
+        // whole vector here would silently delete them on burn-in.
+        targetFilters.erase(
+            std::remove_if(targetFilters.begin(), targetFilters.end(),
+                [](const TargetFilter& f) {
+                    return f.type == FT_MAC_PREFIX || f.type == FT_FULL_MAC;
+                }),
+            targetFilters.end());
         
         // Process OUI entries
         if (request->hasParam("ouis", true)) {
@@ -2391,6 +2603,7 @@ void startConfigMode() {
             setTimeout(function() {
                 window.location.href = 'about:blank';
             }, 3000);
+                    loadSigLines();
         </script>
     </div>
 </body>
@@ -2436,6 +2649,32 @@ void startConfigMode() {
             Serial.printf("Preset %s applied — %d new filters (total: %u)\n",
                           presetName.c_str(), added, (unsigned)targetFilters.size());
         }
+    });
+
+    server.on("/api/presets/remove", HTTP_POST, [](AsyncWebServerRequest *request) {
+        lastConfigActivity = millis();
+        String n;
+        if (request->hasParam("name", true))       n = request->getParam("name", true)->value();
+        else if (request->hasParam("name", false)) n = request->getParam("name", false)->value();
+        n.toLowerCase();
+
+        int removed = 0;
+        if (n == "rayban")      removed = removePreset(PRESET_RAYBAN, PRESET_RAYBAN_COUNT);
+        else if (n == "axon")   removed = removePreset(PRESET_AXON,   PRESET_AXON_COUNT);
+        else { request->send(400, "application/json", "{\"ok\":false,\"error\":\"unknown preset\"}"); return; }
+
+        request->send(200, "application/json",
+            "{\"ok\":true,\"removed\":" + String(removed) +
+            ",\"total_filters\":" + String(targetFilters.size()) + "}");
+    });
+
+    server.on("/api/presets/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String body = "{\"axon\":";
+        body += presetInstalled(PRESET_AXON, PRESET_AXON_COUNT) ? "true" : "false";
+        body += ",\"rayban\":";
+        body += presetInstalled(PRESET_RAYBAN, PRESET_RAYBAN_COUNT) ? "true" : "false";
+        body += "}";
+        request->send(200, "application/json", body);
     });
 
     // Captive portal catch-all: redirect any unknown URL to root
