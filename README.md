@@ -2,7 +2,7 @@
 
 Multi-mode surveillance detection and BLE intelligence firmware for the **Seeed Studio XIAO ESP32-S3**.
 
-One device. Five firmware modes. Select from a boot menu, reboot, and go.
+One device. Four firmware modes. Select from a boot menu, reboot, and go.
 
 ---
 
@@ -96,42 +96,11 @@ curl -X POST http://localhost:5000/api/flock/clear_prev
 
 Full dashboard docs (endpoints, socket events, JSON wire formats, GPS setup, persistence layout, troubleshooting): [colonelpanichacks/flock-you/api/README.md](https://github.com/colonelpanichacks/flock-you/blob/promiscious/api/README.md).
 
-### Mode 4: Flock-You — BLE Edition
-
-Detects Flock Safety surveillance cameras, Raven gunshot detectors, and related monitoring hardware using BLE-only heuristics. All detections are stored in memory and can be exported as JSON or CSV for later analysis.
-
-**Detection methods:**
-
-- **MAC prefix matching** — 42 known Flock Safety MAC prefixes: 39 from **OrdoOuroborous / [@NitekryDPaul](https://github.com/nitekry)**'s [nite-oui-collection](https://github.com/nitekry/nite-oui-collection) promiscuous-mode set (`94:2a:6f` and `f4:e2:c6` demoted in his June 2026 update as Ubiquiti false positives), Michael / DeFlockJoplin's drive-test addition `82:6b:f2` (1), and Flock Safety BLE OUIs `00:40:8c` / `ac:cc:8e` (2) from @NitekryDPaul's July 2026 `groups/le/privacy_invaders_ouis_law_enforcement.csv` addition. All research credit to @NitekryDPaul.
-- **BLE device name patterns** — case-insensitive substring matching for `FS Ext Battery`, `Penguin`, `Flock`, `Pigvision`
-- **BLE manufacturer company ID** — `0x09C8` (XUNTONG), associated with Flock Safety hardware. Catches devices even when no name is broadcast. *Sourced from [wgreenberg/flock-you](https://github.com/wgreenberg/flock-you).*
-- **Raven service UUID matching** — identifies Raven gunshot detection units by their BLE GATT service UUIDs (device info, GPS, power, network, upload, error, legacy health/location services)
-- **Raven firmware version estimation** — determines approximate firmware version (1.1.x / 1.2.x / 1.3.x) based on which service UUIDs are advertised
-
-**Features:**
-
-- AP: `flockyou` / password: `flockyou123`
-- Web dashboard at `192.168.4.1` with live detection feed, full pattern database browser, and export tools
-- **GPS wardriving** — uses your phone's GPS via the browser Geolocation API to tag every detection with coordinates
-- JSON and CSV export of all detections (MAC, name, RSSI, detection method, timestamps, count, Raven status, firmware version, GPS coordinates)
-- JSON-formatted serial output (with GPS) for live ingestion by the companion Flask dashboard
-- Thread-safe detection storage (up to 200 unique devices) with FreeRTOS mutex
-
-**Enabling GPS (Android Chrome):**
-
-The phone's GPS is used to geotag detections. Because the dashboard is served over HTTP, Chrome requires a one-time flag change to allow location access:
-
-1. Open a new Chrome tab and go to `chrome://flags`
-2. Search for **"Insecure origins treated as secure"**
-3. Add `http://192.168.4.1` to the text field
-4. Set the flag to **Enabled**
-5. Tap **Relaunch**
-
-After relaunching, connect to the `flockyou` AP, open `192.168.4.1`, and tap the **GPS** card in the stats bar to grant location permission. Detections will be tagged with coordinates automatically.
-
-> **Note:** iOS Safari does not support Geolocation over HTTP. GPS wardriving requires Android with Chrome.
-
 ### Mode 5: Sky Spy
+
+> Numbering note: mode 4 (Flock-You BLE) was removed. Sky Spy keeps its
+> original number 5 rather than shifting down, so devices with a mode
+> already saved to NVS keep booting into the mode they were set to.
 
 Passive drone detection via FAA Remote ID (Open Drone ID) WiFi beacon monitoring. Listens in promiscuous mode for ASTM F3411 compliant broadcasts and extracts drone telemetry.
 
@@ -156,7 +125,6 @@ Each mode creates its own AP. When switching modes, **your phone/laptop will aut
 | **Detector** | `snoopuntothem` | `astheysnoopuntous` | `192.168.4.1` | Configurable from web dashboard, saved to NVS |
 | **Foxhunter** | `foxhunter` | `foxhunter` | `192.168.4.1` | Fixed credentials |
 | **Flock-You WiFi** | *none* | — | — | No AP — radio is dedicated to promiscuous sniffing; talk to it via USB-CDC commands and the Flask dashboard |
-| **Flock-You BLE** | `flockyou` | `flockyou123` | `192.168.4.1` | Fixed credentials |
 | **Sky Spy** | *none* | — | — | No AP — passive scanner, serial JSON output only |
 
 > **Tip:** If you can't reach the dashboard after a mode switch, check which WiFi network you're connected to. Your device may have auto-joined a previously saved OUI-SPY AP from a different mode.
@@ -335,7 +303,7 @@ cp .pio/build/seeed_xiao_esp32s3/firmware.bin firmware/oui-spy-unified-blue.bin
 
 ## Acknowledgments
 
-**Will Greenberg** ([@wgreenberg](https://github.com/wgreenberg)) — His [flock-you](https://github.com/wgreenberg/flock-you) fork was instrumental in improving the Flock Safety detection heuristics. The BLE manufacturer company ID detection method (`0x09C8` XUNTONG) was sourced directly from his work, along with structured pattern management approaches that informed the detection architecture. Thank you for the research and for making it open.
+**Will Greenberg** ([@wgreenberg](https://github.com/wgreenberg)) — His [flock-you](https://github.com/wgreenberg/flock-you) fork was instrumental in improving the Flock Safety detection heuristics. The BLE manufacturer company ID detection method (`0x09C8` XUNTONG) was sourced directly from his work and shipped in the Flock-You BLE mode; that mode has since been retired in favour of the promiscuous WiFi edition, but the structured pattern-management approach it introduced still informs the detection architecture. Thank you for the research and for making it open.
 
 ---
 

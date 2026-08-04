@@ -144,7 +144,6 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 <div class="i" onclick="go(1)"><div class="n">DETECTOR</div><div class="d">BLE Alert Tool for Specific Devices</div></div>
 <div class="i" onclick="go(2)"><div class="n">FOXHUNTER</div><div class="d">RSSI Proximity Tracker</div></div>
 <div class="i" onclick="go(3)"><div class="n">FLOCK-YOU WIFI</div><div class="d">Promiscuous Mode &bull; @NitekryDPaul / OrdoOuroborous</div></div>
-<div class="i" onclick="go(4)"><div class="n">FLOCK-YOU BLE</div><div class="d">Surveillance Detector &bull; AP: flockyou</div></div>
 <div class="i" onclick="go(5)"><div class="n">SKY SPY</div><div class="d">Drone Remote ID Monitor</div></div>
 </div>
 <div class="ap">
@@ -476,6 +475,17 @@ void setup() {
         Serial.printf("[OUI-SPY] Stored mode from NVS: %d\n", currentMode);
         Serial.flush();
         
+        // Mode 4 was Flock-You BLE, removed in favour of the promiscuous
+        // WiFi edition (mode 3). A device with 4 still in NVS would boot
+        // into nothing, so send it to the selector to pick again.
+        if (currentMode == 4) {
+            Serial.println("[OUI-SPY] Stored mode 4 (Flock-You BLE) was removed - returning to selector");
+            prefs.begin("unified-mode", false);
+            prefs.putInt("mode", 0);
+            prefs.end();
+            currentMode = 0;
+        }
+
         // Validate mode range
         if (currentMode < 0 || currentMode > 5) {
             Serial.printf("[OUI-SPY] Invalid stored mode %d, defaulting to selector\n", currentMode);
@@ -525,11 +535,6 @@ void setup() {
         Serial.println("[OUI-SPY] Promiscuous 2.4 GHz sniffer, no AP, USB-CDC sensor");
         Serial.flush();
         flockyou_promiscious_setup();
-    } else if (currentMode == 4) {
-        Serial.println("[OUI-SPY] >>> STARTING FLOCK-YOU (mode 4) <<<");
-        Serial.println("[OUI-SPY] No WiFi AP (BLE only)");
-        Serial.flush();
-        flockyou_setup();
     } else if (currentMode == 5) {
         Serial.println("[OUI-SPY] >>> STARTING SKY SPY (mode 5) <<<");
         Serial.println("[OUI-SPY] No WiFi AP (BLE only)");
@@ -590,7 +595,6 @@ void loop() {
         case 1: detector_loop(); break;
         case 2: foxhunter_loop(); break;
         case 3: flockyou_promiscious_loop(); break;
-        case 4: flockyou_loop(); break;
         case 5: skyspy_loop(); break;
         default:
             // Selector mode - web server handles everything
