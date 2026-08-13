@@ -6,6 +6,16 @@ One device. Four firmware modes. Select from a boot menu, reboot, and go.
 
 ---
 
+## Web Flasher
+
+Flash straight from the browser — no Python, no PlatformIO, no drivers to think about:
+
+**https://colonelpanichacks.github.io/oui-spy-unified-blue/**
+
+Chrome, Edge, or Opera on desktop (Web Serial API). Plug in the XIAO ESP32-S3 with a USB-C data cable, click **Connect & Flash**, pick the serial port. The page always serves the latest firmware committed to `master`.
+
+---
+
 ## Quick Connect
 
 On first boot, connect to the selector AP to pick a firmware mode:
