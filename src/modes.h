@@ -4,21 +4,21 @@
 // Mode 1: OUI Spy Detector
 void detector_setup();
 void detector_loop();
+void detector_stop();
 
 // Mode 2: Foxhunter
 void foxhunter_setup();
 void foxhunter_loop();
+void foxhunter_stop();
 
 // Mode 3: Flock-You — Promiscuous WiFi Edition
 void flockyou_promiscious_setup();
 void flockyou_promiscious_loop();
-
-// Mode 4: Flock-You
-void flockyou_setup();
-void flockyou_loop();
+void flockyou_promiscious_stop();
 
 // Mode 5: Sky Spy
 void skyspy_setup();
 void skyspy_loop();
+void skyspy_stop();
 
 #endif // MODES_H
