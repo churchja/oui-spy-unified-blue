@@ -2,7 +2,7 @@
 
 Multi-mode surveillance detection and BLE intelligence firmware for the **Seeed Studio XIAO ESP32-S3**.
 
-One device. Four firmware modes. Select from a boot menu, reboot, and go.
+One device. Five firmware modes. Select from a boot menu, reboot, and go.
 
 ---
 
@@ -106,11 +106,22 @@ curl -X POST http://localhost:5000/api/flock/clear_prev
 
 Full dashboard docs (endpoints, socket events, JSON wire formats, GPS setup, persistence layout, troubleshooting): [colonelpanichacks/flock-you/api/README.md](https://github.com/colonelpanichacks/flock-you/blob/promiscious/api/README.md).
 
+### Mode 4: PCAP
+
+Passive WiFi packet capture. Fills the slot vacated by the retired Flock-You BLE mode. Streams a Wireshark-ready pcap (linktype 127, IEEE 802.11 with radiotap) over USB-CDC, hosts a live web dashboard on `ouispy-pcap` / `capturethem`, and keeps a rolling 2 MB in-PSRAM session pcap that the browser can download at any time.
+
+- AP: `ouispy-pcap` / `capturethem` (configurable from the dashboard, stored in the mode's own NVS namespace `pcap-mode`)
+- Dashboard at `http://192.168.4.1` — live packet table, vendor colouring (RING / AXON / FLOCK / DJI / PARROT / SKYDIO / META), chip filters, per-frame CSV snapshot, and one-click session PCAP download
+- Two channel modes: **locked** (AP + one channel) or **hop** (STA, no AP, cycles a user-selected 2.4 GHz channel mask with configurable dwell)
+- Output selectable at runtime: raw PCAP over USB-CDC (for `tcpdump -i - -r`, Wireshark extcap, or `wireshark -k -i -`) or human-readable one-line summaries
+- USB-CDC command protocol (text mode): `CMD:STATUS`, `CMD:VERSION`, `CMD:MODE PCAP|TEXT`, `CMD:CHAN <n>`, `CMD:HOP 0x0422`, `CMD:DWELL <ms>`
+- Wireshark extcap plugin and a Python pipe helper live in the standalone [colonelpanichacks/ouispy-pcap](https://github.com/colonelpanichacks/ouispy-pcap) repo under `tools/`
+
 ### Mode 5: Sky Spy
 
-> Numbering note: mode 4 (Flock-You BLE) was removed. Sky Spy keeps its
-> original number 5 rather than shifting down, so devices with a mode
-> already saved to NVS keep booting into the mode they were set to.
+> Numbering note: Sky Spy keeps its original number 5 (retained after the
+> Flock-You BLE mode was retired) so devices with a mode already saved to
+> NVS keep booting into the mode they were set to. Mode 4 is now PCAP.
 
 Passive drone detection via FAA Remote ID (Open Drone ID) WiFi beacon monitoring. Listens in promiscuous mode for ASTM F3411 compliant broadcasts and extracts drone telemetry.
 
@@ -135,6 +146,7 @@ Each mode creates its own AP. When switching modes, **your phone/laptop will aut
 | **Detector** | `snoopuntothem` | `astheysnoopuntous` | `192.168.4.1` | Configurable from web dashboard, saved to NVS |
 | **Foxhunter** | `foxhunter` | `foxhunter` | `192.168.4.1` | Fixed credentials |
 | **Flock-You WiFi** | *none* | — | — | No AP — radio is dedicated to promiscuous sniffing; talk to it via USB-CDC commands and the Flask dashboard |
+| **PCAP** | `ouispy-pcap` | `capturethem` | `192.168.4.1` | Configurable from mode dashboard, saved to NVS. Hop mode disables the AP — radio is dedicated to sniffing; use USB-CDC then |
 | **Sky Spy** | *none* | — | — | No AP — passive scanner, serial JSON output only |
 
 > **Tip:** If you can't reach the dashboard after a mode switch, check which WiFi network you're connected to. Your device may have auto-joined a previously saved OUI-SPY AP from a different mode.

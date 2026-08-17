@@ -16,6 +16,11 @@ void flockyou_promiscious_setup();
 void flockyou_promiscious_loop();
 void flockyou_promiscious_stop();
 
+// Mode 4: PCAP — Passive WiFi Packet Capture
+void pcap_setup();
+void pcap_loop();
+void pcap_stop();
+
 // Mode 5: Sky Spy
 void skyspy_setup();
 void skyspy_loop();
