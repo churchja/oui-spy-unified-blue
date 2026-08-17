@@ -144,6 +144,7 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 <div class="i" onclick="go(1)"><div class="n">DETECTOR</div><div class="d">BLE Alert Tool for Specific Devices</div></div>
 <div class="i" onclick="go(2)"><div class="n">FOXHUNTER</div><div class="d">RSSI Proximity Tracker</div></div>
 <div class="i" onclick="go(3)"><div class="n">FLOCK-YOU WIFI</div><div class="d">Promiscuous Mode &bull; @NitekryDPaul / OrdoOuroborous</div></div>
+<div class="i" onclick="go(4)"><div class="n">PCAP</div><div class="d">Passive WiFi Capture &bull; Wireshark-ready over USB-CDC + web dashboard</div></div>
 <div class="i" onclick="go(5)"><div class="n">SKY SPY</div><div class="d">Drone Remote ID Monitor</div></div>
 </div>
 <div class="ap">
@@ -161,7 +162,7 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 </div>
 </div>
 <script>
-var info={1:{t:'DETECTOR',s:'Scans for BLE devices and alerts when specific targets are detected. Configure OUI prefixes and MAC addresses to monitor.'},2:{t:'FOXHUNTER',s:'Track down a specific device using RSSI signal strength. Beeps get faster as you get closer to your target.'},3:{t:'FLOCK-YOU WIFI',s:'Passive 2.4 GHz promiscuous-mode detector for Flock Safety. Matches addr1/addr2 OUIs and the DeFlockJoplin wildcard-probe signature. Streams Flask-compatible JSON over USB and persists to SPIFFS; pull history via the CMD:DUMP_PREV protocol. No AP.'},4:{t:'FLOCK-YOU BLE',s:'Detects Flock Safety surveillance cameras via BLE. Serves web dashboard on AP flockyou with live detections, pattern DB, and JSON/CSV export.'},5:{t:'SKY SPY',s:'Monitors for FAA Remote ID broadcasts from drones. Detects Open Drone ID signals over WiFi and BLE.'}};
+var info={1:{t:'DETECTOR',s:'Scans for BLE devices and alerts when specific targets are detected. Configure OUI prefixes and MAC addresses to monitor.'},2:{t:'FOXHUNTER',s:'Track down a specific device using RSSI signal strength. Beeps get faster as you get closer to your target.'},3:{t:'FLOCK-YOU WIFI',s:'Passive 2.4 GHz promiscuous-mode detector for Flock Safety. Matches addr1/addr2 OUIs and the DeFlockJoplin wildcard-probe signature. Streams Flask-compatible JSON over USB and persists to SPIFFS; pull history via the CMD:DUMP_PREV protocol. No AP.'},4:{t:'PCAP',s:'Passive WiFi packet capture. Wireshark-ready PCAP over USB-CDC, live web dashboard at http://192.168.4.1, channel hop across the full 2.4 GHz band, in-PSRAM session PCAP for browser download.'},5:{t:'SKY SPY',s:'Monitors for FAA Remote ID broadcasts from drones. Detects Open Drone ID signals over WiFi and BLE.'}};
 function go(m){var d=info[m];document.getElementById('yt').textContent=d.t;document.getElementById('ys').textContent=d.s;document.getElementById('x').style.display='none';document.getElementById('y').style.display='flex';fetch('/select?mode='+m)}
 function saveAP(){
 var s=document.getElementById('ap_ssid').value.trim();
@@ -474,17 +475,6 @@ void setup() {
         prefs.end();
         Serial.printf("[OUI-SPY] Stored mode from NVS: %d\n", currentMode);
         Serial.flush();
-        
-        // Mode 4 was Flock-You BLE, removed in favour of the promiscuous
-        // WiFi edition (mode 3). A device with 4 still in NVS would boot
-        // into nothing, so send it to the selector to pick again.
-        if (currentMode == 4) {
-            Serial.println("[OUI-SPY] Stored mode 4 (Flock-You BLE) was removed - returning to selector");
-            prefs.begin("unified-mode", false);
-            prefs.putInt("mode", 0);
-            prefs.end();
-            currentMode = 0;
-        }
 
         // Validate mode range
         if (currentMode < 0 || currentMode > 5) {
@@ -535,6 +525,11 @@ void setup() {
         Serial.println("[OUI-SPY] Promiscuous 2.4 GHz sniffer, no AP, USB-CDC sensor");
         Serial.flush();
         flockyou_promiscious_setup();
+    } else if (currentMode == 4) {
+        Serial.println("[OUI-SPY] >>> STARTING PCAP (mode 4) <<<");
+        Serial.println("[OUI-SPY] AP will be: ouispy-pcap  (dashboard http://192.168.4.1)");
+        Serial.flush();
+        pcap_setup();
     } else if (currentMode == 5) {
         Serial.println("[OUI-SPY] >>> STARTING SKY SPY (mode 5) <<<");
         Serial.println("[OUI-SPY] No WiFi AP (BLE only)");
@@ -595,6 +590,7 @@ void loop() {
         case 1: detector_loop(); break;
         case 2: foxhunter_loop(); break;
         case 3: flockyou_promiscious_loop(); break;
+        case 4: pcap_loop(); break;
         case 5: skyspy_loop(); break;
         default:
             // Selector mode - web server handles everything

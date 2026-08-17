@@ -1,5 +1,5 @@
 {
-  "name": "OUI-SPY Dev (experimental)",
+  "name": "OUI-SPY Unified Blue (Dev)",
   "version": "dev",
   "new_install_prompt_erase": true,
   "builds": [
@@ -9,7 +9,7 @@
         { "path": "firmware-dev/bootloader.bin", "offset": 0 },
         { "path": "firmware-dev/partitions.bin", "offset": 32768 },
         { "path": "firmware-dev/boot_app0.bin", "offset": 57344 },
-        { "path": "firmware-dev/ouispy-pcap.bin", "offset": 65536 }
+        { "path": "firmware-dev/unified-blue-dev.bin", "offset": 65536 }
       ]
     }
   ]
