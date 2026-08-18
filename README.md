@@ -2,7 +2,7 @@
 
 Multi-mode surveillance detection and BLE intelligence firmware for the **Seeed Studio XIAO ESP32-S3**.
 
-One device. Five firmware modes. Select from a boot menu, reboot, and go.
+One device. Six firmware modes. Select from a boot menu, reboot, and go.
 
 ---
 
@@ -131,6 +131,21 @@ Passive drone detection via FAA Remote ID (Open Drone ID) WiFi beacon monitoring
 - Real-time logging of all detected drones
 - Dedicated FreeRTOS buzzer task for non-blocking audio alerts
 
+### Mode 6: BLE Sniff
+
+Passive BLE advertising capture. Listens on the three BLE advertising channels (37 / 38 / 39) via NimBLE, streams a Wireshark-ready pcap over USB-CDC using `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR` (linktype 256), and hosts a live web dashboard on `ouispy-blesniff` / `sniffuntothem`. A 2 MB in-PSRAM session pcap is available for browser download at any time.
+
+**Scope:** advertisements only. This mode does not capture connected-device (LL data channel) traffic — it observes the same broadcasts a phone sees while scanning, no more.
+
+- AP: `ouispy-blesniff` / `sniffuntothem` (configurable from the dashboard, stored in the mode's own NVS namespace `blesniff`)
+- Dashboard at `http://192.168.4.1` — live packet table, vendor chips (RING / AXON / FLOCK / DJI / PARROT / SKYDIO / META), advert-type + address-type + trait chip filters, per-frame CSV snapshot, and one-click session PCAP download
+- Output selectable at runtime: raw PCAP over USB-CDC (for `tcpdump -i - -r`, Wireshark extcap, or `wireshark -k -i -`) or human-readable one-line summaries
+- Passive receive only — `setActiveScan(false)` means the radio never transmits a `SCAN_REQ`
+- Scan defaults: `window=30ms`, `interval=100ms` (leaves ~70% of the radio for WiFi coexistence so the AP stays reachable while scanning)
+- USB-CDC command protocol (text mode): `CMD:STATUS`, `CMD:VERSION`, `CMD:MODE PCAP|TEXT`, `CMD:WINDOW <ms>`, `CMD:INTERVAL <ms>`
+- Vendor identify against the OUI Database (same list surfaced by PCAP and Detector)
+- Wireshark extcap plugin and a Python pipe helper live in the standalone [colonelpanichacks/ouispy-blesniff](https://github.com/colonelpanichacks/ouispy-blesniff) repo under `tools/`
+
 ---
 
 ## WiFi Access Points
@@ -148,6 +163,7 @@ Each mode creates its own AP. When switching modes, **your phone/laptop will aut
 | **Flock-You WiFi** | *none* | — | — | No AP — radio is dedicated to promiscuous sniffing; talk to it via USB-CDC commands and the Flask dashboard |
 | **PCAP** | `ouispy-pcap` | `packetsniffer` | `192.168.4.1` | Configurable from mode dashboard, saved to NVS. Hop mode disables the AP — radio is dedicated to sniffing; use USB-CDC then |
 | **Sky Spy** | *none* | — | — | No AP — passive scanner, serial JSON output only |
+| **BLE Sniff** | `ouispy-blesniff` | `sniffuntothem` | `192.168.4.1` | Configurable from mode dashboard, saved to NVS |
 
 > **Tip:** If you can't reach the dashboard after a mode switch, check which WiFi network you're connected to. Your device may have auto-joined a previously saved OUI-SPY AP from a different mode.
 

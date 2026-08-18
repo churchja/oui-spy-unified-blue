@@ -25,6 +25,8 @@ const ModeDef kModes[] = {
       pcap_setup,                 pcap_loop,                 pcap_stop },
     { "skyspy",    "SKY SPY",        "Drone Remote ID monitor",
       skyspy_setup,               skyspy_loop,               skyspy_stop },
+    { "blesniff",  "BLE SNIFF",      "Passive BLE advertising capture (Wireshark-ready)",
+      blesniff_setup,             blesniff_loop,             blesniff_stop },
 };
 constexpr int kModeCount = sizeof(kModes) / sizeof(kModes[0]);
 

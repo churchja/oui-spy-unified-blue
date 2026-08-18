@@ -26,4 +26,9 @@ void skyspy_setup();
 void skyspy_loop();
 void skyspy_stop();
 
+// Mode 6: BLE Sniff — Passive BLE advertising capture
+void blesniff_setup();
+void blesniff_loop();
+void blesniff_stop();
+
 #endif // MODES_H
