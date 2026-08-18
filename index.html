@@ -374,7 +374,7 @@ d8P'  `Y8b  `888'     `8' `888'            d8P'    `Y8 `888   `Y88.  `888.   .8'
 </section>
 
 <section class="panel">
-  <header><span>Modes</span><span class="right">Boot Selector + 4 tools</span></header>
+  <header><span>Modes</span><span class="right">Boot Selector + 6 tools</span></header>
   <div class="body">
 
     <div class="mode">
@@ -421,12 +421,34 @@ d8P'  `Y8b  `888'     `8' `888'            d8P'    `Y8 `888   `Y88.  `888.   .8'
     </div>
 
     <div class="mode">
+      <span class="tag">[ 4 ]</span>
+      <h3>PCAP</h3>
+      <p>Passive 2.4&nbsp;GHz WiFi packet capture. Wireshark-ready pcap (linktype 127, radiotap) over USB-CDC, live dashboard with vendor colouring and chip filters, rolling 2&nbsp;MB in-PSRAM session pcap the browser can download at any time. Locked-channel (AP up) or hop mode (AP down, USB only).</p>
+      <dl class="creds">
+        <dt>Wi-Fi</dt><dd>ouispy-pcap</dd>
+        <dt>Password</dt><dd>packetsniffer</dd>
+        <dt>Open</dt><dd class="url">http://192.168.4.1</dd>
+      </dl>
+    </div>
+
+    <div class="mode">
       <span class="tag">[ 5 ]</span>
       <h3>Sky Spy</h3>
       <p>FAA Remote ID / Open Drone ID (ASTM F3411) beacon capture. Pulls serial, operator ID, lat/lon, altitude, speed, and heading from every ODID message type.</p>
       <dl class="creds">
         <dt>Wi-Fi</dt><dd class="none">no AP</dd>
         <dt>Access</dt><dd>serial JSON out</dd>
+      </dl>
+    </div>
+
+    <div class="mode">
+      <span class="tag">[ 6 ]</span>
+      <h3>BLE Sniff</h3>
+      <p>Passive BLE advertising capture across channels 37/38/39. Wireshark-ready pcap (linktype 256, LE&nbsp;LL with PHDR) over USB-CDC, live dashboard with vendor identify against the OUI Database (RING / AXON / FLOCK / DJI / PARROT / SKYDIO / META&nbsp;/&nbsp;Ray-Ban) matched on MAC OUI, Bluetooth SIG company ID, service UUID, or name substring. Advertisements only — connected-device pairing traffic needs an nRF52 sniffer.</p>
+      <dl class="creds">
+        <dt>Wi-Fi</dt><dd>ouispy-blesniff</dd>
+        <dt>Password</dt><dd>sniffuntothem</dd>
+        <dt>Open</dt><dd class="url">http://192.168.4.1</dd>
       </dl>
     </div>
 
