@@ -421,9 +421,17 @@ constexpr uint32_t PCAP_SNAPLEN      = 512;
 // Advertising channel access address (little-endian on wire: D6 BE 89 8E).
 constexpr uint32_t ADV_ACCESS_ADDR   = 0x8E89BED6;
 
-// Pseudo-header flags: dewhitened | signal-power-valid | ref-AA-valid |
-//                      CRC-checked | CRC-valid = 0x0613
-constexpr uint16_t PHDR_FLAGS        = 0x0613;
+// Pseudo-header flags for advertising packets. Bit layout per Wireshark's
+// btle_rf dissector (verified against tshark -G fields):
+//   bit 0 (0x0001) dewhitened
+//   bit 1 (0x0002) signal-power-valid
+//   bit 4 (0x0010) reference-access-address-valid
+//   bits 7-9 (0x0380) PDU Type: 0=Advertising, 4=CIS C->P, etc.
+//   bit 10 (0x0400) CRC checked
+//   bit 11 (0x0800) CRC valid
+// PDU Type left at 0 (Advertising). CRC bits cleared because we synthesize
+// zero CRC bytes -- claiming "checked" would make Wireshark flag CRC-bad.
+constexpr uint16_t PHDR_FLAGS        = 0x0013;
 
 size_t build_frame(const scan::Frame& f, uint8_t* out) {
     uint8_t* p = out;
