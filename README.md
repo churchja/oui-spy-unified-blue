@@ -108,14 +108,14 @@ Full dashboard docs (endpoints, socket events, JSON wire formats, GPS setup, per
 
 ### Mode 4: PCAP
 
-Passive WiFi packet capture. Fills the slot vacated by the retired Flock-You BLE mode. Streams a Wireshark-ready pcap (linktype 127, IEEE 802.11 with radiotap) over USB-CDC, hosts a live web dashboard on `ouispy-pcap` / `packetsniffer`, and keeps a rolling 2 MB in-PSRAM session pcap that the browser can download at any time.
+Passive WiFi packet capture. Fills the slot vacated by the retired Flock-You BLE mode. Hosts a live web dashboard on `ouispy-pcap` / `packetsniffer` and keeps a rolling 2 MB in-PSRAM session pcap (linktype 127, IEEE 802.11 with radiotap) that the browser can download at any time via **Save PCAP**.
 
 - AP: `ouispy-pcap` / `packetsniffer` (configurable from the dashboard, stored in the mode's own NVS namespace `pcap-mode`)
 - Dashboard at `http://192.168.4.1` — live packet table, vendor colouring (RING / AXON / FLOCK / DJI / PARROT / SKYDIO / META), chip filters, per-frame CSV snapshot, and one-click session PCAP download
 - Two channel modes: **locked** (AP + one channel) or **hop** (STA, no AP, cycles a user-selected 2.4 GHz channel mask with configurable dwell)
-- Output selectable at runtime: raw PCAP over USB-CDC (for `tcpdump -i - -r`, Wireshark extcap, or `wireshark -k -i -`) or human-readable one-line summaries
-- USB-CDC command protocol (text mode): `CMD:STATUS`, `CMD:VERSION`, `CMD:MODE PCAP|TEXT`, `CMD:CHAN <n>`, `CMD:HOP 0x0422`, `CMD:DWELL <ms>`
-- Wireshark extcap plugin and a Python pipe helper live in the standalone [colonelpanichacks/ouispy-pcap](https://github.com/colonelpanichacks/ouispy-pcap) repo under `tools/`
+- USB-CDC output: human-readable one-line summaries per frame (scriptable)
+- USB-CDC command protocol: `CMD:STATUS`, `CMD:VERSION`, `CMD:CHAN <n>`, `CMD:HOP 0x0422`, `CMD:DWELL <ms>`
+- The USB PCAP binary streaming path (previously extcap / pipe helpers) has been removed — ESP32-S3 Arduino USB CDC is not reliable for high-rate binary streaming. Use the dashboard **Save PCAP** button instead; the download parses cleanly in Wireshark regardless of capture rate.
 
 ### Mode 5: Sky Spy
 
@@ -133,18 +133,18 @@ Passive drone detection via FAA Remote ID (Open Drone ID) WiFi beacon monitoring
 
 ### Mode 6: BLE Sniff
 
-Passive BLE advertising capture. Listens on the three BLE advertising channels (37 / 38 / 39) via NimBLE, streams a Wireshark-ready pcap over USB-CDC using `LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR` (linktype 256), and hosts a live web dashboard on `ouispy-blesniff` / `sniffuntothem`. A 2 MB in-PSRAM session pcap is available for browser download at any time.
+Passive BLE advertising capture. Listens on the three BLE advertising channels (37 / 38 / 39) via NimBLE, hosts a live web dashboard on `ouispy-blesniff` / `sniffuntothem`, and keeps a rolling 2 MB in-PSRAM session pcap (`LINKTYPE_BLUETOOTH_LE_LL_WITH_PHDR`, linktype 256) that the browser can download at any time via **Save PCAP**.
 
 **Scope:** advertisements only. This mode does not capture connected-device (LL data channel) traffic — it observes the same broadcasts a phone sees while scanning, no more.
 
 - AP: `ouispy-blesniff` / `sniffuntothem` (configurable from the dashboard, stored in the mode's own NVS namespace `blesniff`)
 - Dashboard at `http://192.168.4.1` — live packet table, vendor chips (RING / AXON / FLOCK / DJI / PARROT / SKYDIO / META), advert-type + address-type + trait chip filters, per-frame CSV snapshot, and one-click session PCAP download
-- Output selectable at runtime: raw PCAP over USB-CDC (for `tcpdump -i - -r`, Wireshark extcap, or `wireshark -k -i -`) or human-readable one-line summaries
+- USB-CDC output: human-readable one-line summaries per advert (scriptable)
 - Passive receive only — `setActiveScan(false)` means the radio never transmits a `SCAN_REQ`
 - Scan defaults: `window=30ms`, `interval=100ms` (leaves ~70% of the radio for WiFi coexistence so the AP stays reachable while scanning)
-- USB-CDC command protocol (text mode): `CMD:STATUS`, `CMD:VERSION`, `CMD:MODE PCAP|TEXT`, `CMD:WINDOW <ms>`, `CMD:INTERVAL <ms>`
+- USB-CDC command protocol: `CMD:STATUS`, `CMD:VERSION`, `CMD:WINDOW <ms>`, `CMD:INTERVAL <ms>`
 - Vendor identify against the OUI Database (same list surfaced by PCAP and Detector)
-- Wireshark extcap plugin and a Python pipe helper live in the standalone [colonelpanichacks/ouispy-blesniff](https://github.com/colonelpanichacks/ouispy-blesniff) repo under `tools/`
+- The USB PCAP binary streaming path (previously extcap / pipe helpers) has been removed — ESP32-S3 Arduino USB CDC is not reliable for high-rate binary streaming. Use the dashboard **Save PCAP** button instead; the download parses cleanly in Wireshark regardless of capture rate.
 
 ---
 

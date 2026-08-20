@@ -48,9 +48,6 @@ static const ledc_timer_t   BLESNIFF_BUZZER_TIMER = LEDC_TIMER_0;
 // ---------------------------------------------------------------------------
 namespace config {
 
-constexpr uint8_t OUT_PCAP = 0;
-constexpr uint8_t OUT_TEXT = 1;
-
 // Filter mask bits - matched against per-advert traits at capture time.
 // Advert type bits use the wire-level LE LL PDU type numbering.
 constexpr uint8_t FT_ADV_IND       = 0x01;
@@ -66,8 +63,9 @@ constexpr uint8_t FT_DEFAULT =
     FT_ADV_IND | FT_ADV_DIRECT | FT_ADV_NONCONN | FT_SCAN_RSP | FT_ADV_SCAN_IND |
     FT_ADDR_PUBLIC | FT_ADDR_RANDOM;
 
+// USB output is text-only (line summaries + CMD replies). PCAP binary
+// capture lives on the dashboard exclusively -- GET /api/session.pcap.
 struct Config {
-    uint8_t  out_mode;
     uint16_t scan_window_ms;
     uint16_t scan_interval_ms;
     uint8_t  ft_mask;
@@ -83,7 +81,6 @@ Preferences prefs;
 Config      cfg;
 
 void apply_defaults() {
-    cfg.out_mode         = OUT_PCAP;
     // Leave ~70% of the 2.4 GHz radio for WiFi coexistence so the AP stays
     // reachable while we scan. window==interval starves SoftAP beacons.
     cfg.scan_window_ms   = 30;
@@ -94,7 +91,6 @@ void apply_defaults() {
 }
 
 void clamp() {
-    if (cfg.out_mode > OUT_TEXT)               cfg.out_mode = OUT_PCAP;
     if (cfg.scan_window_ms < 10)               cfg.scan_window_ms = 10;
     if (cfg.scan_window_ms > 2000)             cfg.scan_window_ms = 2000;
     if (cfg.scan_interval_ms < 20)             cfg.scan_interval_ms = 20;
@@ -113,7 +109,6 @@ Config&     get()        { return cfg; }
 void save() {
     clamp();
     prefs.begin(NS, false);
-    prefs.putUChar ("out",      cfg.out_mode);
     prefs.putUShort("scan_win", cfg.scan_window_ms);
     prefs.putUShort("scan_int", cfg.scan_interval_ms);
     prefs.putUChar ("ftmask",   cfg.ft_mask);
@@ -125,7 +120,6 @@ void save() {
 void load() {
     apply_defaults();
     prefs.begin(NS, true);
-    cfg.out_mode         = prefs.getUChar ("out",      cfg.out_mode);
     cfg.scan_window_ms   = prefs.getUShort("scan_win", cfg.scan_window_ms);
     cfg.scan_interval_ms = prefs.getUShort("scan_int", cfg.scan_interval_ms);
     cfg.ft_mask          = prefs.getUChar ("ftmask",   cfg.ft_mask);
@@ -137,7 +131,6 @@ void load() {
 
 void reset_defaults() { apply_defaults(); save(); }
 
-void set_out(uint8_t o)             { cfg.out_mode = (o > OUT_TEXT) ? OUT_PCAP : o; save(); }
 void set_scan_window(uint16_t ms)   { cfg.scan_window_ms = ms;   save(); }
 void set_scan_interval(uint16_t ms) { cfg.scan_interval_ms = ms; save(); }
 void set_ftmask(uint8_t m)          { cfg.ft_mask = m ? m : FT_DEFAULT; save(); }
@@ -703,70 +696,14 @@ size_t format_line(const scan::Frame& f, char* out, size_t out_sz) {
 } // namespace text_summary
 
 // ---------------------------------------------------------------------------
-// pcap_stream - USB-CDC pcap/text output
+// pcap_stream - USB-CDC text output only.
+// PCAP binary capture lives on the dashboard exclusively -- GET
+// /api/session.pcap in the web_dashboard namespace below. session_pcap
+// still uses nordic_pcap::build_frame for its in-PSRAM buffer. The USB
+// CDC layer on ESP32-S3 could not be made reliable for high-rate binary
+// streaming (residual byte-boundary corruption under load).
 // ---------------------------------------------------------------------------
 namespace pcap_stream {
-
-bool header_emitted = false;
-
-struct __attribute__((packed)) PcapGlobal {
-    uint32_t magic;
-    uint16_t vmaj;
-    uint16_t vmin;
-    int32_t  thiszone;
-    uint32_t sigfigs;
-    uint32_t snaplen;
-    uint32_t linktype;
-};
-
-struct __attribute__((packed)) PcapRec {
-    uint32_t ts_sec;
-    uint32_t ts_usec;
-    uint32_t incl_len;
-    uint32_t orig_len;
-};
-
-void write_global_header() {
-    PcapGlobal g{};
-    g.magic     = nordic_pcap::PCAP_MAGIC;
-    g.vmaj      = nordic_pcap::PCAP_VER_MAJOR;
-    g.vmin      = nordic_pcap::PCAP_VER_MINOR;
-    g.thiszone  = 0;
-    g.sigfigs   = 0;
-    g.snaplen   = nordic_pcap::PCAP_SNAPLEN;
-    g.linktype  = nordic_pcap::PCAP_LINKTYPE;
-    Serial.write((const uint8_t*)&g, sizeof(g));
-    header_emitted = true;
-}
-
-void ensure_header_for_current_mode() {
-    if (config::get().out_mode == config::OUT_PCAP && !header_emitted) {
-        write_global_header();
-    }
-}
-
-void begin() {
-    header_emitted = false;
-    ensure_header_for_current_mode();
-}
-
-void on_mode_changed() {
-    header_emitted = false;
-    ensure_header_for_current_mode();
-}
-
-void write_frame_pcap(const scan::Frame& f) {
-    // Stage the full record in a single BSS buffer, then one Serial.write().
-    static uint8_t stage[sizeof(PcapRec) + nordic_pcap::FRAME_OVERHEAD + scan::MAX_PAYLOAD];
-    size_t body = nordic_pcap::build_frame(f, stage + sizeof(PcapRec));
-    PcapRec rec{};
-    rec.ts_sec   = f.ts_sec;
-    rec.ts_usec  = f.ts_usec;
-    rec.incl_len = (uint32_t)body;
-    rec.orig_len = (uint32_t)body;
-    memcpy(stage, &rec, sizeof(rec));
-    Serial.write(stage, sizeof(rec) + body);
-}
 
 void write_frame_text(const scan::Frame& f) {
     char line[320];
@@ -2217,7 +2154,6 @@ void send_status() {
     doc["dropped_dash"] = scan::dropped_dash();
     doc["session_bytes"] = (uint32_t)session_pcap::size();
     doc["fw"] = config::FW_VERSION();
-    doc["out"] = config::get().out_mode == config::OUT_PCAP ? "PCAP" : "TEXT";
 
     char buf[400];
     size_t n = serializeJson(doc, buf, sizeof(buf));
@@ -2292,7 +2228,6 @@ void dashboard_task(void*) {
 void handle_get_config(AsyncWebServerRequest* req) {
     StaticJsonDocument<512> doc;
     const auto& c = config::get();
-    doc["out"]      = c.out_mode;
     doc["scan_win"] = c.scan_window_ms;
     doc["scan_int"] = c.scan_interval_ms;
     doc["ftmask"]   = c.ft_mask;
@@ -2320,12 +2255,7 @@ void handle_post_config(AsyncWebServerRequest* req, uint8_t* data, size_t len, s
     if (err) { req->send(400, "application/json", "{\"error\":\"json\"}"); return; }
 
     bool need_apply_scan = false;
-    bool need_pcap_hdr   = false;
 
-    if (doc.containsKey("out")) {
-        uint8_t o = doc["out"];
-        if (o != config::get().out_mode) { config::set_out(o); need_pcap_hdr = true; }
-    }
     if (doc.containsKey("scan_win")) {
         uint16_t v = doc["scan_win"];
         if (v != config::get().scan_window_ms) { config::set_scan_window(v); need_apply_scan = true; }
@@ -2340,7 +2270,6 @@ void handle_post_config(AsyncWebServerRequest* req, uint8_t* data, size_t len, s
     }
 
     if (need_apply_scan) scan::apply_scan_params();
-    if (need_pcap_hdr)   pcap_stream::on_mode_changed();
 
     req->send(200, "application/json", "{\"ok\":true}");
 }
@@ -2495,17 +2424,15 @@ void led_task(void*) {
 }
 
 void pcap_writer_task(void*) {
+    // USB output is text only. Full PCAP capture lives on the dashboard
+    // (GET /api/session.pcap). session_pcap::append fills the download
+    // buffer for every frame regardless of USB text emission.
     for (;;) {
         scan::Frame f;
         int drained = 0;
         while (drained < 16 && scan::pop_pcap(&f)) {
             last_advert_ms = millis();
-            if (config::get().out_mode == config::OUT_PCAP) {
-                pcap_stream::ensure_header_for_current_mode();
-                pcap_stream::write_frame_pcap(f);
-            } else {
-                pcap_stream::write_frame_text(f);
-            }
+            pcap_stream::write_frame_text(f);
             session_pcap::append(f);
             drained++;
         }
@@ -2515,8 +2442,8 @@ void pcap_writer_task(void*) {
 
 // USB-CDC command protocol - same shape as the standalone.
 String upper_s(const String& s) { String o = s; o.toUpperCase(); return o; }
-void   reply_ok()               { if (config::get().out_mode == config::OUT_TEXT) Serial.println(F("OK")); }
-void   reply_err(const char* m) { if (config::get().out_mode == config::OUT_TEXT) { Serial.print(F("ERR ")); Serial.println(m); } }
+void   reply_ok()               { Serial.println(F("OK")); }
+void   reply_err(const char* m) { Serial.print(F("ERR ")); Serial.println(m); }
 
 void handle_serial_cmd(const String& raw) {
     String line = raw; line.trim();
@@ -2526,14 +2453,12 @@ void handle_serial_cmd(const String& raw) {
     String U = upper_s(body);
 
     if (U == "STATUS") {
-        if (config::get().out_mode != config::OUT_TEXT) return;
         IPAddress ip = WiFi.softAPIP();
         String apmac = WiFi.softAPmacAddress();
-        Serial.printf("{\"out\":\"%s\",\"scan_win\":%u,\"scan_int\":%u,\"ftmask\":\"0x%02x\","
+        Serial.printf("{\"scan_win\":%u,\"scan_int\":%u,\"ftmask\":\"0x%02x\","
             "\"total\":%u,\"pps\":%u,\"drop_pcap\":%u,\"drop_dash\":%u,\"fw\":\"%s\","
             "\"ap_ssid\":\"%s\",\"ap_ip\":\"%s\",\"ap_mac\":\"%s\",\"ap_stations\":%u,"
             "\"session_bytes\":%u}\n",
-            config::get().out_mode == config::OUT_PCAP ? "PCAP" : "TEXT",
             (unsigned)config::get().scan_window_ms,
             (unsigned)config::get().scan_interval_ms,
             (unsigned)config::get().ft_mask,
@@ -2548,15 +2473,14 @@ void handle_serial_cmd(const String& raw) {
         return;
     }
     if (U == "VERSION") {
-        if (config::get().out_mode != config::OUT_TEXT) return;
         Serial.printf("OUI-SPY BLESNIFF %s built %s %s\n", config::FW_VERSION(), __DATE__, __TIME__);
         return;
     }
     if (U.startsWith("MODE ")) {
-        String v = U.substring(5); v.trim();
-        if (v == "PCAP") { config::set_out(config::OUT_PCAP); pcap_stream::on_mode_changed(); reply_ok(); return; }
-        if (v == "TEXT") { config::set_out(config::OUT_TEXT); pcap_stream::on_mode_changed(); reply_ok(); return; }
-        reply_err("bad mode"); return;
+        // Kept as a compatibility no-op. USB output is text only; PCAP
+        // binary capture lives on the dashboard at /api/session.pcap.
+        reply_ok();
+        return;
     }
     if (U.startsWith("WINDOW ")) {
         int v = U.substring(7).toInt();
@@ -2620,7 +2544,8 @@ void setup() {
         g_fault = Fault::Scan;
     }
 
-    pcap_stream::begin();
+    // pcap_stream no longer needs init -- USB output is text-only, session
+    // buffer for the dashboard is initialized separately.
 
     // pcap_writer_task copies scan::Frame (~280B) into a stack local per pop;
     // 8KB is comfortable headroom.
