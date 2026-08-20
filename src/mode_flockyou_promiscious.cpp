@@ -26,6 +26,7 @@
 #include <ctype.h>
 #include <string.h>
 #include <SPIFFS.h>
+#include <Preferences.h>
 #include "modes.h"
 
 // Rename setup/loop so they don't collide with the unified main.cpp's
@@ -42,3 +43,4 @@ namespace {
 
 void flockyou_promiscious_setup() { flockyou_promiscious_ns_setup(); }
 void flockyou_promiscious_loop()  { flockyou_promiscious_ns_loop(); }
+void flockyou_promiscious_stop()  { /* Stage 1: disable promiscuous cb, flush SPIFFS session */ }
