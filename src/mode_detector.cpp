@@ -20,6 +20,8 @@
 #include <nvs_flash.h>
 #include <vector>
 #include <algorithm>
+#include <FS.h>
+#include <SPIFFS.h>
 #include <Adafruit_NeoPixel.h>
 #include "modes.h"
 
