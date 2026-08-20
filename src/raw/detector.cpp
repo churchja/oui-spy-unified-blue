@@ -12,6 +12,8 @@
 #include <nvs_flash.h>
 #include <vector>
 #include <algorithm>
+#include <FS.h>
+#include <SPIFFS.h>
 #include <Adafruit_NeoPixel.h>
 
 // ================================
@@ -119,10 +121,89 @@ std::vector<DeviceInfo> devices;
 std::vector<TargetFilter> targetFilters;
 std::vector<DeviceAlias> deviceAliases;
 
+// ================================
+// Firmware version (reported over CMD:VERSION and /api/session)
+// ================================
+#ifndef DETECTOR_FW_VERSION
+#define DETECTOR_FW_VERSION "1.1.0"
+#endif
+
+// ================================
+// BLE detection session — flock-you dashboard companion.
+//
+// Mirrors the Mode 3 (flock-you WiFi) persistence + protocol so the same Flask
+// dashboard can pull BLE detections. The subsystem is fully self-contained:
+// everything below is prefixed `ble` / `BLE_SESSION_*` so it can be lifted
+// wholesale without disturbing Mode 1's target-filter web UI, buzzer, LED,
+// NeoPixel, alias, or NVS code paths.
+//
+// Wire format (SPIFFS envelope):
+//   Line 1:  {"v":1,"count":N,"bytes":B,"crc":"0xXXXXXXXX"}\n
+//   Line 2+: [{"mac":...},...]      (exactly B bytes, CRC32 == X)
+//
+// Files live at /ble_session.* — DIFFERENT from Mode 3's /session.* so a
+// device flashed between modes can't cross-contaminate the payload stream.
+// ================================
+#define BLE_SESSION_FILE     "/ble_session.json"
+#define BLE_SESSION_TMP      "/ble_session.tmp"
+#define BLE_PREV_FILE        "/ble_prev_session.json"
+#define BLE_MAX_DETECTIONS   256
+#define BLE_AUTOSAVE_MS      60000
+#define BLE_CMD_BUF_LEN      160
+
+// Match-method labels (also the JSON `match_method` field value).
+#define BLE_MM_OUI_PREFIX     "oui_prefix"
+#define BLE_MM_FULL_MAC       "full_mac"
+#define BLE_MM_COMPANY_ID     "company_id"
+#define BLE_MM_SERVICE_UUID   "service_uuid"
+#define BLE_MM_NAME_SUBSTRING "name_substring"
+#define BLE_MM_UNKNOWN        "unknown"
+
+// Address-type labels — mapped from NimBLE getAddressType() plus the top-2-bit
+// check on the first octet for random addresses (RFC-standard RPA/NRPA/static).
+#define BLE_ADDR_LABEL_PUBLIC "public"
+#define BLE_ADDR_LABEL_RANDOM "random_static"
+#define BLE_ADDR_LABEL_RPA    "rpa"
+#define BLE_ADDR_LABEL_NRPA   "nrpa"
+
+// Per-detection record. Kept flat + fixed-size so the whole table can be
+// mem-serialized without touching the heap during autosave.
+typedef struct {
+    char     mac[18];              // "aa:bb:cc:dd:ee:ff\0"
+    char     addrType[16];         // "public" / "random_static" / "rpa" / "nrpa"
+    char     matchMethod[20];      // oui_prefix / full_mac / company_id / ...
+    char     matchedSig[64];       // human-readable label from OUI Database entry
+    char     localName[32];        // truncated device name (may be empty)
+    uint16_t companyId;            // 0xFFFF when N/A
+    uint16_t serviceUuid;          // 0x0000 when N/A
+    int8_t   rssiMin;              // weakest RSSI seen
+    int8_t   rssiMax;              // strongest RSSI seen
+    uint32_t firstSeen;            // millis() at first hit
+    uint32_t lastSeen;             // millis() at latest hit
+    uint16_t hitCount;
+} BLEDetection;
+
+static BLEDetection  bleDet[BLE_MAX_DETECTIONS];
+static int           bleDetCount     = 0;
+static bool          bleSpiffsReady  = false;
+static bool          bleSessionDirty = false;
+static unsigned long bleLastSaveAt   = 0;
+static int           bleLastSaveCount = 0;
+static bool          blePrevExists   = false;
+static size_t        blePrevBytes    = 0;
+static char          bleCmdBuf[BLE_CMD_BUF_LEN];
+static size_t        bleCmdLen       = 0;
+
 // Forward declarations
 void startScanningMode();
 void startDetectionFlash();
 class MyAdvertisedDeviceCallbacks;
+static void bleSessionSetup();
+static void blePollSerialCmd();
+static void bleAutosaveTick();
+static void bleRegisterWebEndpoints();
+static void bleNoteDetection(NimBLEAdvertisedDevice* dev, const String& mac,
+                             int rssi, const String& matchedSig);
 
 // ================================
 // Serial Configuration
@@ -578,6 +659,668 @@ bool matchesTargetFilter(NimBLEAdvertisedDevice* dev, const String& deviceMAC,
         }
     }
     return false;
+}
+
+// ================================================================
+// BLE detection session subsystem
+// ================================================================
+//
+// Mirrors Mode 3 (flock-you WiFi)'s persistence + protocol shape so the same
+// Flask dashboard can pull BLE detections. Kept below matchesTargetFilter()
+// so the classifier here can re-use its normalisation helpers.
+//
+// Threading model: everything below is called from loop() only. onResult()
+// (BLE scan-task callback) delegates to bleNoteDetection() via the atomic
+// `newMatchFound` flag path that already exists — so we never touch this
+// table from an ISR.
+// ================================================================
+
+// Re-classify a MAC/device that matchesTargetFilter() has already accepted.
+// We can't get the method from matchesTargetFilter() (task says preserve it
+// verbatim), so we replay the same rules and record which one hit. Returns
+// the method label string; also fills in the company_id / service_uuid it
+// carried, when available.
+static const char* bleClassifyMatch(NimBLEAdvertisedDevice* dev,
+                                    const String& deviceMAC,
+                                    uint16_t& outCompanyId,
+                                    uint16_t& outServiceUuid) {
+    outCompanyId   = 0xFFFF;
+    outServiceUuid = 0x0000;
+
+    String normDev = deviceMAC;
+    normalizeMACAddress(normDev);
+
+    for (const TargetFilter& filter : targetFilters) {
+        switch (filter.type) {
+            case FT_FULL_MAC: {
+                String id = filter.identifier;
+                normalizeMACAddress(id);
+                if (normDev.equals(id)) return BLE_MM_FULL_MAC;
+                break;
+            }
+            case FT_MAC_PREFIX: {
+                String id = filter.identifier;
+                normalizeMACAddress(id);
+                if (normDev.startsWith(id)) return BLE_MM_OUI_PREFIX;
+                break;
+            }
+            case FT_COMPANY_ID: {
+                if (!dev || !dev->haveManufacturerData()) break;
+                std::string mfr = dev->getManufacturerData();
+                if (mfr.length() < 2) break;
+                uint16_t cid = (uint8_t)mfr[0] | ((uint8_t)mfr[1] << 8);
+                char cidHex[5];
+                snprintf(cidHex, sizeof(cidHex), "%04x", cid);
+                if (normalizeHexId(filter.identifier).equals(cidHex)) {
+                    outCompanyId = cid;
+                    return BLE_MM_COMPANY_ID;
+                }
+                break;
+            }
+            case FT_SERVICE_UUID_16: {
+                if (!dev) break;
+                String target = normalizeHexId(filter.identifier);
+                for (int i = 0; i < dev->getServiceUUIDCount(); i++) {
+                    NimBLEUUID uuid = dev->getServiceUUID(i);
+                    String s = uuid.toString().c_str();
+                    s.toLowerCase();
+                    if ((s.length() == 4 && s.equals(target)) ||
+                        (s.length() >= 8 && s.substring(4, 8).equals(target))) {
+                        outServiceUuid = (uint16_t)strtoul(target.c_str(), nullptr, 16);
+                        return BLE_MM_SERVICE_UUID;
+                    }
+                }
+                break;
+            }
+            case FT_NAME_SUBSTRING: {
+                if (!dev || !dev->haveName()) break;
+                String name = dev->getName().c_str();
+                if (nameContains(name, filter.identifier)) return BLE_MM_NAME_SUBSTRING;
+                break;
+            }
+        }
+    }
+    return BLE_MM_UNKNOWN;
+}
+
+// Return the "public"/"random_static"/"rpa"/"nrpa" label for a NimBLE addr.
+// For random addresses the top two bits of the first octet distinguish
+// static-random (11), resolvable private (10), and non-resolvable private (00).
+static const char* bleAddrTypeLabel(uint8_t nimbleType, const String& mac) {
+    if (nimbleType == 0 /*BLE_ADDR_PUBLIC*/) return BLE_ADDR_LABEL_PUBLIC;
+    // Random of any flavour — decode top 2 bits of MSB octet.
+    int colon = mac.indexOf(':');
+    if (colon <= 0) return BLE_ADDR_LABEL_RANDOM;
+    String hex = mac.substring(0, colon);
+    if (hex.length() < 2) return BLE_ADDR_LABEL_RANDOM;
+    uint8_t b0 = (uint8_t)strtoul(hex.c_str(), nullptr, 16);
+    uint8_t top = (b0 >> 6) & 0x03;
+    if (top == 0b11) return BLE_ADDR_LABEL_RANDOM;  // static random
+    if (top == 0b10) return BLE_ADDR_LABEL_RPA;     // resolvable
+    if (top == 0b00) return BLE_ADDR_LABEL_NRPA;    // non-resolvable
+    return BLE_ADDR_LABEL_RANDOM;                    // reserved encoding
+}
+
+// ---------- JSON escape (SSID / device name is user-controlled) ----------
+
+static size_t bleJsonEscape(char* dst, size_t cap, const char* src) {
+    size_t o = 0;
+    if (cap == 0 || !src) return 0;
+    for (size_t i = 0; src[i]; i++) {
+        char c = src[i];
+        if (c == '"' || c == '\\') {
+            if (o + 2 >= cap) break;
+            dst[o++] = '\\'; dst[o++] = c;
+        } else if ((unsigned char)c < 0x20) {
+            if (o + 6 >= cap) break;
+            int n = snprintf(dst + o, cap - o, "\\u%04x", (unsigned)(unsigned char)c);
+            if (n <= 0 || (size_t)n >= cap - o) break;
+            o += (size_t)n;
+        } else {
+            if (o + 1 >= cap) break;
+            dst[o++] = c;
+        }
+    }
+    dst[o] = '\0';
+    return o;
+}
+
+// ---------- CRC32 (zlib polynomial, matches Mode 3's fyCRC32) ----------
+
+static uint32_t bleCRC32Update(uint32_t crc, const uint8_t* buf, size_t len) {
+    crc = ~crc;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= buf[i];
+        for (int k = 0; k < 8; k++) {
+            crc = (crc >> 1) ^ (0xEDB88320u & -(int32_t)(crc & 1));
+        }
+    }
+    return ~crc;
+}
+
+// ---------- Detection serialisation ----------
+//
+// Line schema matches the WiFi-side "detection" line the flock-you dashboard
+// already ingests, minus WiFi-specific fields (channel/frequency/tier) and
+// plus BLE-specific ones (addr_type, company_id, service_uuid, local_name,
+// match_method, matched_signature). `protocol` is "ble" and `event` is
+// "detection" so the same JSON-per-line parser picks it up.
+
+static size_t bleSerializeDet(const BLEDetection& d, char* dst, size_t cap,
+                              const char* replay_source) {
+    char nameEsc[sizeof(d.localName) * 6 + 1];
+    char sigEsc[sizeof(d.matchedSig) * 6 + 1];
+    bleJsonEscape(nameEsc, sizeof(nameEsc), d.localName);
+    bleJsonEscape(sigEsc,  sizeof(sigEsc),  d.matchedSig);
+
+    // Company ID / service UUID are omitted as fields (rendered as null) when
+    // sentinel — dashboards can distinguish "not-applicable" from a real 0.
+    char cidStr[8]; char svcStr[8];
+    if (d.companyId  == 0xFFFF) snprintf(cidStr, sizeof(cidStr), "null");
+    else                        snprintf(cidStr, sizeof(cidStr), "%u", (unsigned)d.companyId);
+    if (d.serviceUuid == 0x0000) snprintf(svcStr, sizeof(svcStr), "null");
+    else                         snprintf(svcStr, sizeof(svcStr), "%u", (unsigned)d.serviceUuid);
+
+    int n = snprintf(dst, cap,
+        "{\"event\":\"detection\","
+        "\"protocol\":\"ble\","
+        "\"detection_method\":\"ble_%s\","
+        "\"mac_address\":\"%s\","
+        "\"addr_type\":\"%s\","
+        "\"rssi\":%d,"
+        "\"rssi_min\":%d,"
+        "\"rssi_max\":%d,"
+        "\"company_id\":%s,"
+        "\"service_uuid\":%s,"
+        "\"local_name\":\"%s\","
+        "\"device_name\":\"%s\","
+        "\"match_method\":\"%s\","
+        "\"matched_signature\":\"%s\","
+        "\"first_seen_ms\":%lu,"
+        "\"last_seen_ms\":%lu,"
+        "\"hit_count\":%u%s%s%s}",
+        d.matchMethod,
+        d.mac,
+        d.addrType,
+        (int)d.rssiMax,
+        (int)d.rssiMin,
+        (int)d.rssiMax,
+        cidStr,
+        svcStr,
+        nameEsc,
+        nameEsc,
+        d.matchMethod,
+        sigEsc,
+        (unsigned long)d.firstSeen,
+        (unsigned long)d.lastSeen,
+        (unsigned)d.hitCount,
+        replay_source ? ",\"replay_source\":\"" : "",
+        replay_source ? replay_source           : "",
+        replay_source ? "\""                    : "");
+    return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+// ---------- Detection table update ----------
+//
+// Called from bleNoteDetection() with a MAC that has already matched the
+// active target filters. Returns true iff this call created a NEW row (used
+// to gate the live JSON emission — mirrors Mode 3's chirp-worthy dedup so
+// the RE-3s / RE-30s re-hit alerts don't spam the dashboard).
+
+static bool bleTableUpsert(const char* mac, const char* addrType,
+                           const char* method, const char* matchedSig,
+                           const char* localName, uint16_t cid, uint16_t svc,
+                           int8_t rssi, BLEDetection** outRow) {
+    uint32_t now = millis();
+    for (int i = 0; i < bleDetCount; i++) {
+        if (strcasecmp(bleDet[i].mac, mac) == 0) {
+            BLEDetection& d = bleDet[i];
+            if (d.hitCount < 0xFFFF) d.hitCount++;
+            d.lastSeen = now;
+            if (rssi < d.rssiMin) d.rssiMin = rssi;
+            if (rssi > d.rssiMax) d.rssiMax = rssi;
+            if (localName && localName[0] && !d.localName[0]) {
+                strlcpy(d.localName, localName, sizeof(d.localName));
+            }
+            if (cid != 0xFFFF && d.companyId == 0xFFFF)  d.companyId  = cid;
+            if (svc != 0x0000 && d.serviceUuid == 0x0000) d.serviceUuid = svc;
+            bleSessionDirty = true;
+            if (outRow) *outRow = &d;
+            return false;
+        }
+    }
+    if (bleDetCount >= BLE_MAX_DETECTIONS) {
+        // LRU-drop the oldest row (smallest lastSeen).
+        int oldest = 0;
+        for (int i = 1; i < bleDetCount; i++) {
+            if (bleDet[i].lastSeen < bleDet[oldest].lastSeen) oldest = i;
+        }
+        // Shift down the tail to keep the array packed.
+        for (int i = oldest; i < bleDetCount - 1; i++) bleDet[i] = bleDet[i + 1];
+        bleDetCount--;
+    }
+    BLEDetection& d = bleDet[bleDetCount];
+    memset(&d, 0, sizeof(d));
+    strlcpy(d.mac,          mac,        sizeof(d.mac));
+    strlcpy(d.addrType,     addrType,   sizeof(d.addrType));
+    strlcpy(d.matchMethod,  method,     sizeof(d.matchMethod));
+    strlcpy(d.matchedSig,   matchedSig ? matchedSig : "", sizeof(d.matchedSig));
+    if (localName) strlcpy(d.localName, localName, sizeof(d.localName));
+    d.companyId   = cid;
+    d.serviceUuid = svc;
+    d.rssiMin     = rssi;
+    d.rssiMax     = rssi;
+    d.firstSeen   = now;
+    d.lastSeen    = now;
+    d.hitCount    = 1;
+    bleDetCount++;
+    bleSessionDirty = true;
+    if (outRow) *outRow = &d;
+    return true;
+}
+
+// ---------- Envelope pass 1: compute payload bytes + CRC ----------
+
+static uint32_t bleComputePayloadCRC(size_t& outBytes) {
+    char line[512];
+    uint32_t crc = 0;
+    outBytes = 0;
+    crc = bleCRC32Update(crc, (const uint8_t*)"[", 1); outBytes += 1;
+    for (int i = 0; i < bleDetCount; i++) {
+        if (i > 0) { crc = bleCRC32Update(crc, (const uint8_t*)",", 1); outBytes += 1; }
+        size_t n = bleSerializeDet(bleDet[i], line, sizeof(line), nullptr);
+        if (n == 0) continue;
+        crc = bleCRC32Update(crc, (const uint8_t*)line, n);
+        outBytes += n;
+    }
+    crc = bleCRC32Update(crc, (const uint8_t*)"]", 1); outBytes += 1;
+    return crc;
+}
+
+// ---------- Envelope parse / validate / promote ----------
+
+static bool bleParseEnvelope(const char* hdr, size_t& outBytes, uint32_t& outCrc) {
+    const char* b = strstr(hdr, "\"bytes\":");
+    const char* c = strstr(hdr, "\"crc\":\"0x");
+    if (!b || !c) return false;
+    long long bv = 0;
+    if (sscanf(b + 8, "%lld", &bv) != 1 || bv < 0) return false;
+    unsigned cv = 0;
+    if (sscanf(c + 9, "%x", &cv) != 1) return false;
+    outBytes = (size_t)bv;
+    outCrc   = (uint32_t)cv;
+    return true;
+}
+
+static bool bleValidateSessionFile(const char* path) {
+    if (!SPIFFS.exists(path)) return false;
+    File f = SPIFFS.open(path, "r");
+    if (!f) return false;
+    String hdr = f.readStringUntil('\n');
+    if (hdr.length() < 10 || hdr[0] != '{') { f.close(); return false; }
+    size_t   expBytes = 0;
+    uint32_t expCRC   = 0;
+    if (!bleParseEnvelope(hdr.c_str(), expBytes, expCRC)) { f.close(); return false; }
+    size_t bodyOff = hdr.length() + 1;
+    size_t fSize   = f.size();
+    if (fSize < bodyOff + expBytes || (fSize - bodyOff) != expBytes) {
+        f.close(); return false;
+    }
+    uint8_t buf[256];
+    uint32_t crc = 0;
+    size_t remaining = expBytes;
+    while (remaining > 0) {
+        int n = f.read(buf, remaining < sizeof(buf) ? remaining : sizeof(buf));
+        if (n <= 0) break;
+        crc = bleCRC32Update(crc, buf, (size_t)n);
+        remaining -= (size_t)n;
+    }
+    f.close();
+    return (remaining == 0 && crc == expCRC);
+}
+
+static bool bleSpiffsCopy(const char* src, const char* dst) {
+    File s = SPIFFS.open(src, "r");
+    if (!s) return false;
+    File d = SPIFFS.open(dst, "w");
+    if (!d) { s.close(); return false; }
+    uint8_t buf[256];
+    int n; bool ok = true;
+    while ((n = s.read(buf, sizeof(buf))) > 0) {
+        if (d.write(buf, (size_t)n) != (size_t)n) { ok = false; break; }
+    }
+    s.close(); d.close();
+    return ok;
+}
+
+static bool bleAtomicPromote(const char* src, const char* dst) {
+    if (SPIFFS.rename(src, dst)) return true;
+    if (!bleSpiffsCopy(src, dst)) return false;
+    SPIFFS.remove(src);
+    return true;
+}
+
+static void bleRefreshPrevMeta() {
+    blePrevExists = SPIFFS.exists(BLE_PREV_FILE);
+    if (blePrevExists) {
+        File f = SPIFFS.open(BLE_PREV_FILE, "r");
+        blePrevBytes = f ? f.size() : 0;
+        if (f) f.close();
+    } else {
+        blePrevBytes = 0;
+    }
+}
+
+// ---------- Save the current in-RAM table to SPIFFS ----------
+
+static void bleSaveSession() {
+    if (!bleSpiffsReady) return;
+    if (!bleSessionDirty && bleDetCount == bleLastSaveCount) return;
+
+    size_t   payloadBytes = 0;
+    uint32_t crc          = bleComputePayloadCRC(payloadBytes);
+    int      savedCount   = bleDetCount;
+
+    File f = SPIFFS.open(BLE_SESSION_TMP, "w");
+    if (!f) {
+        Serial.printf("[ble_session] save failed: cannot open %s\n", BLE_SESSION_TMP);
+        return;
+    }
+    f.printf("{\"v\":1,\"count\":%d,\"bytes\":%u,\"crc\":\"0x%08lX\"}\n",
+             savedCount, (unsigned)payloadBytes, (unsigned long)crc);
+
+    char line[512];
+    size_t wrote = 0;
+    f.write((uint8_t*)"[", 1); wrote++;
+    for (int i = 0; i < bleDetCount; i++) {
+        if (i > 0) { f.write((uint8_t*)",", 1); wrote++; }
+        size_t n = bleSerializeDet(bleDet[i], line, sizeof(line), nullptr);
+        if (n == 0) continue;
+        f.write((uint8_t*)line, n);
+        wrote += n;
+    }
+    f.write((uint8_t*)"]", 1); wrote++;
+    f.close();
+
+    if (wrote != payloadBytes) {
+        Serial.printf("[ble_session] save WARN: wrote %u expected %u — aborting\n",
+                      (unsigned)wrote, (unsigned)payloadBytes);
+        return;
+    }
+    if (!bleValidateSessionFile(BLE_SESSION_TMP)) {
+        Serial.println("[ble_session] save verify FAILED — old session preserved");
+        return;
+    }
+
+    SPIFFS.remove(BLE_SESSION_FILE);
+    if (!bleAtomicPromote(BLE_SESSION_TMP, BLE_SESSION_FILE)) {
+        Serial.printf("[ble_session] promote FAILED — data in %s for recovery\n",
+                      BLE_SESSION_TMP);
+        return;
+    }
+
+    bleLastSaveAt    = millis();
+    bleLastSaveCount = savedCount;
+    bleSessionDirty  = false;
+}
+
+// ---------- Boot: promote any prior session into /ble_prev_session.json ----------
+
+static void blePromotePrevSession() {
+    if (!bleSpiffsReady) return;
+    const char* source = nullptr;
+    if      (bleValidateSessionFile(BLE_SESSION_FILE)) source = BLE_SESSION_FILE;
+    else if (bleValidateSessionFile(BLE_SESSION_TMP))  source = BLE_SESSION_TMP;
+
+    if (!source) {
+        if (SPIFFS.exists(BLE_SESSION_FILE)) SPIFFS.remove(BLE_SESSION_FILE);
+        if (SPIFFS.exists(BLE_SESSION_TMP))  SPIFFS.remove(BLE_SESSION_TMP);
+        bleRefreshPrevMeta();
+        return;
+    }
+    if (!bleSpiffsCopy(source, BLE_PREV_FILE)) {
+        Serial.printf("[ble_session] promote failed: %s -> %s\n", source, BLE_PREV_FILE);
+        return;
+    }
+    if (SPIFFS.exists(BLE_SESSION_FILE)) SPIFFS.remove(BLE_SESSION_FILE);
+    if (SPIFFS.exists(BLE_SESSION_TMP))  SPIFFS.remove(BLE_SESSION_TMP);
+    bleRefreshPrevMeta();
+}
+
+static void bleSessionSetup() {
+    if (SPIFFS.begin(true)) {
+        bleSpiffsReady = true;
+        Serial.println("[ble_session] SPIFFS ready");
+        blePromotePrevSession();
+    } else {
+        Serial.println("[ble_session] SPIFFS init FAILED — running without persistence");
+        bleSpiffsReady = false;
+    }
+}
+
+static void bleAutosaveTick() {
+    if (!bleSpiffsReady || !bleSessionDirty) return;
+    if (millis() - bleLastSaveAt < BLE_AUTOSAVE_MS) return;
+    bleSaveSession();
+}
+
+// ---------- Live-detection hook (called from onResult path) ----------
+//
+// The scan callback still runs its beep/flash/on-device-table logic verbatim.
+// This function is called in ADDITION to that path for every hit; internally
+// it dedupes new-row vs re-hit to gate the live JSON emit so that repeat
+// sightings don't spam the dashboard (mirrors Mode 3's chirp-worthy filter).
+
+static void bleNoteDetection(NimBLEAdvertisedDevice* dev, const String& mac,
+                             int rssi, const String& matchedSig) {
+    if (!dev) return;
+
+    uint16_t cid = 0xFFFF, svc = 0x0000;
+    const char* method = bleClassifyMatch(dev, mac, cid, svc);
+    const char* addrTy = bleAddrTypeLabel(dev->getAddressType(), mac);
+
+    String nameStr;
+    if (dev->haveName()) nameStr = dev->getName().c_str();
+    char nameBuf[32];
+    strlcpy(nameBuf, nameStr.c_str(), sizeof(nameBuf));
+
+    char macBuf[18];
+    strlcpy(macBuf, mac.c_str(), sizeof(macBuf));
+    // Force lowercase for a canonical key.
+    for (char* p = macBuf; *p; p++) *p = tolower(*p);
+
+    BLEDetection* row = nullptr;
+    bool created = bleTableUpsert(macBuf, addrTy, method, matchedSig.c_str(),
+                                  nameBuf, cid, svc, (int8_t)rssi, &row);
+
+    // Emit the live JSON line only on the FIRST sighting so the dashboard
+    // doesn't get spammed by re-hits — matches Mode 3's dedup contract.
+    if (created && row && isSerialConnected()) {
+        char line[600];
+        size_t n = bleSerializeDet(*row, line, sizeof(line), "live");
+        if (n > 0) {
+            Serial.write((const uint8_t*)line, n);
+            Serial.print('\n');
+        }
+    }
+}
+
+// ---------- CMD: serial protocol (mirrors Mode 3 line-wrap contract) ----------
+//
+// Streams are wrapped BEGIN/END so the Flask dashboard's line reader can
+// tell exactly where a dump starts and ends. Payload lines carry the exact
+// same JSON schema the live path emits (with `replay_source` set to
+// "flash" or "ram" instead of "live").
+
+static void bleReplyOk()             { Serial.println(F("OK")); }
+static void bleReplyErr(const char* m){ Serial.print(F("ERR ")); Serial.println(m); }
+
+static void bleDumpPrev() {
+    if (!bleSpiffsReady) { bleReplyErr("spiffs not ready"); return; }
+    if (!SPIFFS.exists(BLE_PREV_FILE)) {
+        Serial.println(F("BEGIN_DUMP prev bytes=0 count=0"));
+        Serial.println(F("END_DUMP prev count=0"));
+        return;
+    }
+    File f = SPIFFS.open(BLE_PREV_FILE, "r");
+    if (!f) { bleReplyErr("open prev failed"); return; }
+    String hdr = f.readStringUntil('\n');
+    size_t bytes = 0; uint32_t crc = 0;
+    bleParseEnvelope(hdr.c_str(), bytes, crc);
+    // Count entries = number of top-level '{' in the payload.
+    // We stream the payload as-is (verbatim), but split into one JSON object
+    // per line so the dashboard's line reader can ingest without a stream
+    // parser. Each object gets `"replay_source":"flash"` injected before
+    // the closing brace.
+    String body;
+    body.reserve(bytes + 16);
+    while (f.available()) body += (char)f.read();
+    f.close();
+
+    // Strip surrounding [ ]
+    int start = body.indexOf('[');
+    int end   = body.lastIndexOf(']');
+    if (start < 0 || end < 0 || end <= start) {
+        bleReplyErr("prev payload malformed");
+        return;
+    }
+    body = body.substring(start + 1, end);
+
+    // Split by top-level commas (assume no ',' inside strings for simplicity —
+    // our serializer never emits one; user-controlled fields are JSON-escaped
+    // so ',' can appear but only inside a string. We track brace depth to be
+    // safe on both counts.)
+    std::vector<String> objs;
+    int depth = 0; int objStart = -1;
+    for (int i = 0; i < (int)body.length(); i++) {
+        char c = body[i];
+        if (c == '{') { if (depth == 0) objStart = i; depth++; }
+        else if (c == '}') {
+            depth--;
+            if (depth == 0 && objStart >= 0) {
+                objs.push_back(body.substring(objStart, i + 1));
+                objStart = -1;
+            }
+        }
+    }
+
+    Serial.printf("BEGIN_DUMP prev bytes=%u count=%u\n",
+                  (unsigned)bytes, (unsigned)objs.size());
+    for (size_t i = 0; i < objs.size(); i++) {
+        String s = objs[i];
+        // Inject `,"replay_source":"flash"` before the closing '}'
+        int close = s.lastIndexOf('}');
+        if (close > 0) {
+            s = s.substring(0, close) + ",\"replay_source\":\"flash\"}";
+        }
+        Serial.println(s);
+    }
+    Serial.printf("END_DUMP prev count=%u\n", (unsigned)objs.size());
+}
+
+static void bleDumpLive() {
+    Serial.printf("BEGIN_DUMP live bytes=0 count=%u\n", (unsigned)bleDetCount);
+    char line[600];
+    for (int i = 0; i < bleDetCount; i++) {
+        size_t n = bleSerializeDet(bleDet[i], line, sizeof(line), "ram");
+        if (n > 0) {
+            Serial.write((const uint8_t*)line, n);
+            Serial.print('\n');
+        }
+    }
+    Serial.printf("END_DUMP live count=%u\n", (unsigned)bleDetCount);
+}
+
+static void bleCmdStatus() {
+    Serial.printf(
+        "{\"mode\":\"ble_detector\",\"fw\":\"%s\",\"uptime_s\":%lu,"
+        "\"live_count\":%u,\"prev_exists\":%s,\"prev_bytes\":%u,"
+        "\"heap\":%u}\n",
+        DETECTOR_FW_VERSION,
+        (unsigned long)(millis() / 1000UL),
+        (unsigned)bleDetCount,
+        blePrevExists ? "true" : "false",
+        (unsigned)blePrevBytes,
+        (unsigned)ESP.getFreeHeap());
+}
+
+static void bleCmdVersion() {
+    Serial.printf("OUI-SPY BLE DETECTOR %s built %s %s\n",
+                  DETECTOR_FW_VERSION, __DATE__, __TIME__);
+}
+
+static void bleCmdClearPrev() {
+    if (!bleSpiffsReady) { bleReplyErr("spiffs not ready"); return; }
+    if (SPIFFS.exists(BLE_PREV_FILE)) SPIFFS.remove(BLE_PREV_FILE);
+    bleRefreshPrevMeta();
+    bleReplyOk();
+}
+
+static void bleCmdClearLive() {
+    bleDetCount     = 0;
+    bleSessionDirty = true;
+    bleReplyOk();
+}
+
+static void bleHandleCmdLine(const String& raw) {
+    String line = raw; line.trim();
+    if (!line.startsWith("CMD:") && !line.startsWith("cmd:")) return;
+    String body = line.substring(4); body.trim(); body.toUpperCase();
+
+    if      (body == "DUMP_PREV")  { bleDumpPrev(); }
+    else if (body == "DUMP_LIVE")  { bleDumpLive(); }
+    else if (body == "CLEAR_PREV") { bleCmdClearPrev(); }
+    else if (body == "CLEAR_LIVE") { bleCmdClearLive(); }
+    else if (body == "STATUS")     { bleCmdStatus(); }
+    else if (body == "VERSION")    { bleCmdVersion(); }
+    else                           { bleReplyErr("unknown"); }
+}
+
+static void blePollSerialCmd() {
+    while (Serial.available() > 0) {
+        int c = Serial.read();
+        if (c < 0) break;
+        if (c == '\n' || c == '\r') {
+            if (bleCmdLen > 0) {
+                bleCmdBuf[bleCmdLen] = '\0';
+                bleHandleCmdLine(String(bleCmdBuf));
+                bleCmdLen = 0;
+            }
+            continue;
+        }
+        if (bleCmdLen < BLE_CMD_BUF_LEN - 1) {
+            bleCmdBuf[bleCmdLen++] = (char)c;
+        } else {
+            bleCmdLen = 0;   // overflow — drop the whole line rather than truncate
+        }
+    }
+}
+
+// ---------- On-device web endpoints for the same operations ----------
+
+static void bleRegisterWebEndpoints() {
+    server.on("/api/session", HTTP_GET, [](AsyncWebServerRequest *request) {
+        char body[192];
+        snprintf(body, sizeof(body),
+                 "{\"live_count\":%u,\"prev_exists\":%s,\"prev_bytes\":%u,\"heap_free\":%u}",
+                 (unsigned)bleDetCount,
+                 blePrevExists ? "true" : "false",
+                 (unsigned)blePrevBytes,
+                 (unsigned)ESP.getFreeHeap());
+        request->send(200, "application/json", body);
+    });
+
+    server.on("/api/session/clear_prev", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (bleSpiffsReady && SPIFFS.exists(BLE_PREV_FILE)) SPIFFS.remove(BLE_PREV_FILE);
+        bleRefreshPrevMeta();
+        request->send(200, "application/json", "{\"ok\":true}");
+    });
+
+    server.on("/api/session/clear_live", HTTP_POST, [](AsyncWebServerRequest *request) {
+        bleDetCount     = 0;
+        bleSessionDirty = true;
+        request->send(200, "application/json", "{\"ok\":true}");
+    });
 }
 
 // ================================
@@ -2678,6 +3421,11 @@ void startConfigMode() {
         request->send(200, "application/json", body);
     });
 
+    // BLE session subsystem endpoints — same operations as the CMD: serial
+    // protocol, surfaced to the on-device dashboard. Read-mostly, no burn-in
+    // gate: the underlying data is purely observational.
+    bleRegisterWebEndpoints();
+
     // Captive portal catch-all: redirect any unknown URL to root
     server.onNotFound([](AsyncWebServerRequest *request) {
         request->redirect("http://192.168.4.1/");
@@ -2703,8 +3451,13 @@ class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
 
         String matchedDescription;
         bool matchFound = matchesTargetFilter(advertisedDevice, mac, matchedDescription);
-        
+
         if (matchFound) {
+            // Feed the BLE session subsystem BEFORE the existing beep/flash
+            // path so a first-sight JSON line lands on the wire promptly.
+            // bleNoteDetection dedups internally so re-hits don't spam.
+            bleNoteDetection(advertisedDevice, mac, rssi, matchedDescription);
+
             bool known = false;
             for (auto& dev : devices) {
                 if (dev.macAddress == mac) {
@@ -2978,13 +3731,18 @@ void setup() {
         }
     }
     
+    // BLE session subsystem — init AFTER the factory-reset NVS wipe (they
+    // live in different partitions but we want SPIFFS-init failures reported
+    // in the same block as everything else). Non-fatal if SPIFFS is missing.
+    bleSessionSetup();
+
     if (configLocked) {
         Serial.println("======================================");
         Serial.println("CONFIGURATION LOCKED (BURNED IN)");
         Serial.println("Skipping config mode - going straight to scanning");
         Serial.println("To unlock: hold BOOT during power-on (or erase flash)");
         Serial.println("======================================");
-        
+
         // Start scanning immediately
         startScanningMode();
     } else {
@@ -3002,7 +3760,14 @@ void loop() {
     static unsigned long lastCleanupTime = 0;
     static unsigned long lastStatusTime = 0;
     unsigned long currentMillis = millis();
-    
+
+    // BLE session subsystem — always pump the serial CMD: protocol and the
+    // autosave tick regardless of config/scanning state so the dashboard can
+    // still pull the prior session (or clear it) while the device is sitting
+    // in the config-mode captive portal.
+    blePollSerialCmd();
+    bleAutosaveTick();
+
     if (currentMode == CONFIG_MODE) {
         detectorDNS.processNextRequest();  // Captive portal DNS
         // Check for scheduled normal restart (from burn-in config)
