@@ -82,6 +82,30 @@ String matchType = "";  // "NEW", "RE-3s", "RE-30s"
 bool buzzerEnabled = true;
 bool ledEnabled = true;
 
+// Filter classification — determines which BLE advert field the matcher
+// checks against `identifier`. Values are persisted to NVS; do NOT
+// renumber existing entries or old configs will break.
+enum FilterType : uint8_t {
+    FT_MAC_PREFIX      = 0,  // identifier = 6-char OUI (e.g. "985949")
+    FT_FULL_MAC        = 1,  // identifier = 12-char MAC
+    FT_COMPANY_ID      = 2,  // identifier = 4-char hex "0D53" (BT SIG mfr CID)
+    FT_SERVICE_UUID_16 = 3,  // identifier = 4-char hex "FD5F" (BT SIG 16-bit svc UUID)
+    FT_NAME_SUBSTRING  = 4,  // identifier = case-insensitive substring
+};
+
+// Short code shown on the dashboard match-type badge. Kept in sync with
+// the standalone ouispy-detector so the palette is identical.
+static const char* filterTypeCode(FilterType t) {
+    switch (t) {
+        case FT_MAC_PREFIX:      return "OUI";
+        case FT_FULL_MAC:        return "MAC";
+        case FT_COMPANY_ID:      return "CID";
+        case FT_SERVICE_UUID_16: return "SVC";
+        case FT_NAME_SUBSTRING:  return "NAME";
+    }
+    return "OUI";
+}
+
 // Device tracking
 struct DeviceInfo {
     String macAddress;
@@ -92,17 +116,8 @@ struct DeviceInfo {
     unsigned long cooldownUntil;
     const char* matchedFilter;
     String filterDescription;  // Store filter description for persistence
-};
-
-// Filter classification — determines which BLE advert field the matcher
-// checks against `identifier`. Values are persisted to NVS; do NOT
-// renumber existing entries or old configs will break.
-enum FilterType : uint8_t {
-    FT_MAC_PREFIX      = 0,  // identifier = 6-char OUI (e.g. "985949")
-    FT_FULL_MAC        = 1,  // identifier = 12-char MAC
-    FT_COMPANY_ID      = 2,  // identifier = 4-char hex "0D53" (BT SIG mfr CID)
-    FT_SERVICE_UUID_16 = 3,  // identifier = 4-char hex "FD5F" (BT SIG 16-bit svc UUID)
-    FT_NAME_SUBSTRING  = 4,  // identifier = case-insensitive substring
+    String matchedIdentifier;  // Raw identifier that triggered (e.g. "985949")
+    FilterType matchedType = FT_MAC_PREFIX;  // Which filter class hit
 };
 
 struct TargetFilter {
@@ -585,6 +600,65 @@ static String normalizeHexId(const String& in) {
         if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) out += c;
     }
     return out;
+}
+
+// Second-pass classifier for the DeviceInfo row / dashboard badge. We keep
+// matchesTargetFilter()'s signature untouched (upstream code depends on it),
+// so this helper replays the same rules to recover which filter class hit
+// and the raw identifier. Called only on NEW devices in the BLE callback,
+// so the redundant pass is not on the hot per-advertisement path.
+static bool resolveMatchedFilterMeta(NimBLEAdvertisedDevice* dev,
+                                     const String& deviceMAC,
+                                     FilterType& outType,
+                                     String& outIdent) {
+    String norm = deviceMAC; normalizeMACAddress(norm);
+    for (const TargetFilter& f : targetFilters) {
+        switch (f.type) {
+            case FT_MAC_PREFIX: {
+                String id = f.identifier; normalizeMACAddress(id);
+                if (norm.startsWith(id)) { outType = f.type; outIdent = f.identifier; return true; }
+                break;
+            }
+            case FT_FULL_MAC: {
+                String id = f.identifier; normalizeMACAddress(id);
+                if (norm.equals(id)) { outType = f.type; outIdent = f.identifier; return true; }
+                break;
+            }
+            case FT_COMPANY_ID: {
+                if (!dev || !dev->haveManufacturerData()) break;
+                std::string mfr = dev->getManufacturerData();
+                if (mfr.length() < 2) break;
+                uint16_t cid = (uint8_t)mfr[0] | ((uint8_t)mfr[1] << 8);
+                char cidHex[5]; snprintf(cidHex, sizeof(cidHex), "%04x", cid);
+                if (normalizeHexId(f.identifier).equals(cidHex)) {
+                    outType = f.type; outIdent = f.identifier; return true;
+                }
+                break;
+            }
+            case FT_SERVICE_UUID_16: {
+                if (!dev) break;
+                String target = normalizeHexId(f.identifier);
+                for (int i = 0; i < dev->getServiceUUIDCount(); i++) {
+                    NimBLEUUID uuid = dev->getServiceUUID(i);
+                    String s = uuid.toString().c_str(); s.toLowerCase();
+                    if ((s.length() == 4 && s.equals(target)) ||
+                        (s.length() >= 8 && s.substring(4, 8).equals(target))) {
+                        outType = f.type; outIdent = f.identifier; return true;
+                    }
+                }
+                break;
+            }
+            case FT_NAME_SUBSTRING: {
+                if (!dev || !dev->haveName()) break;
+                String name = dev->getName().c_str();
+                if (nameContains(name, f.identifier)) {
+                    outType = f.type; outIdent = f.identifier; return true;
+                }
+                break;
+            }
+        }
+    }
+    return false;
 }
 
 bool matchesTargetFilter(NimBLEAdvertisedDevice* dev, const String& deviceMAC,
@@ -1311,6 +1385,40 @@ static void bleRegisterWebEndpoints() {
     });
 
     server.on("/api/session/clear_prev", HTTP_POST, [](AsyncWebServerRequest *request) {
+        if (bleSpiffsReady && SPIFFS.exists(BLE_PREV_FILE)) SPIFFS.remove(BLE_PREV_FILE);
+        bleRefreshPrevMeta();
+        request->send(200, "application/json", "{\"ok\":true}");
+    });
+
+    // Previous-session panel data source. Strips the envelope header line
+    // from /ble_prev_session.json and returns the raw JSON payload array,
+    // giving the dashboard the same shape as the standalone detector's
+    // /api/session/previous. Empty array on any error / missing file.
+    server.on("/api/session/previous", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!bleSpiffsReady || !SPIFFS.exists(BLE_PREV_FILE)) {
+            request->send(200, "application/json", "[]");
+            return;
+        }
+        File f = SPIFFS.open(BLE_PREV_FILE, "r");
+        if (!f) { request->send(200, "application/json", "[]"); return; }
+        f.readStringUntil('\n');  // discard envelope header
+        String body;
+        body.reserve(f.size());
+        while (f.available()) body += (char)f.read();
+        f.close();
+        int lo = body.indexOf('[');
+        int hi = body.lastIndexOf(']');
+        if (lo < 0 || hi < 0 || hi <= lo) {
+            request->send(200, "application/json", "[]");
+            return;
+        }
+        request->send(200, "application/json", body.substring(lo, hi + 1));
+    });
+
+    // Symmetric alias for the standalone detector's endpoint name — the
+    // same operation as /api/session/clear_prev, kept so a shared front-end
+    // codebase can hit either firmware.
+    server.on("/api/session/clear_previous", HTTP_POST, [](AsyncWebServerRequest *request) {
         if (bleSpiffsReady && SPIFFS.exists(BLE_PREV_FILE)) SPIFFS.remove(BLE_PREV_FILE);
         bleRefreshPrevMeta();
         request->send(200, "application/json", "{\"ok\":true}");
@@ -2128,6 +2236,16 @@ DD:EE:FF:ab:cd:ef
                 <div id="clearDeviceBtn" style="margin-bottom: 10px; text-align: right; display: none;">
                     <button type="button" onclick="clearDeviceHistory()" style="background: #8b0000; padding: 8px 16px; font-size: 13px; margin: 0;">Clear Device History</button>
                 </div>
+                <div id="previousSessionPanel" style="display: none; margin-bottom: 15px; border: 1px solid rgba(255,255,255,0.12); border-radius: 8px; overflow: hidden; background: rgba(255,255,255,0.015);">
+                    <div style="display:flex; align-items:center; justify-content:space-between; padding: 10px 14px; background: rgba(255,255,255,0.04); cursor: pointer;" onclick="togglePrevSession()">
+                        <span id="previousSessionTitle" style="font-family:'Courier New',monospace; font-size:12px; letter-spacing:1px; color:#4ecdc4;">PREVIOUS SESSION (0)</span>
+                        <span style="display:flex; align-items:center; gap:10px;">
+                            <button type="button" onclick="event.stopPropagation(); clearPreviousSession();" style="background:#4a0000; padding:4px 10px; font-size:11px; margin:0;">Clear</button>
+                            <span id="previousSessionCaret" style="color:#888; font-size:11px;">[-]</span>
+                        </span>
+                    </div>
+                    <div id="previousSessionList" class="device-list" style="opacity: 0.65; padding: 10px 12px; max-height: 300px;"></div>
+                </div>
                 <div id="deviceList" class="device-list">
                     <div style="text-align: center; padding: 30px; color: #888888;">
                         <p style="font-size: 14px;">No device records in storage.</p>
@@ -2263,13 +2381,43 @@ DD:EE:FF:ab:cd:ef
                     font-size: 11px;
                     font-style: italic;
                 }
+                .match-badge {
+                    display: inline-block;
+                    padding: 2px 7px;
+                    border-radius: 10px;
+                    font-family: 'Courier New', monospace;
+                    font-size: 10px;
+                    font-weight: 700;
+                    letter-spacing: 0.5px;
+                    background: rgba(0,0,0,0.35);
+                    border: 1px solid currentColor;
+                    text-shadow: 0 0 4px currentColor;
+                }
+                .match-badge.type-OUI  { color: #00d4ff; }
+                .match-badge.type-MAC  { color: #ff2ee0; }
+                .match-badge.type-CID  { color: #ffb020; }
+                .match-badge.type-SVC  { color: #a3ff2e; }
+                .match-badge.type-NAME { color: #ff6b9d; }
+                .prev-tag {
+                    display: inline-block;
+                    margin-left: 6px;
+                    padding: 1px 6px;
+                    border-radius: 4px;
+                    font-family: 'Courier New', monospace;
+                    font-size: 9px;
+                    letter-spacing: 0.5px;
+                    color: #888;
+                    border: 1px solid rgba(255,255,255,0.15);
+                    background: rgba(255,255,255,0.03);
+                }
             </style>
             
             <script>
             // Load detected devices on page load
             window.addEventListener('DOMContentLoaded', function() {
                 loadDetectedDevices();
-                
+                loadPreviousSession();
+
                 // Ensure form submits on first click (mobile fix)
                 const configForm = document.getElementById('configForm');
                 if (configForm) {
@@ -2340,9 +2488,12 @@ DD:EE:FF:ab:cd:ef
                                 }
                                 
                                 infoRow.appendChild(macSpan);
+                                if (device.type) {
+                                    infoRow.appendChild(makeMatchBadge(device.type, device.filter, device.match));
+                                }
                                 infoRow.appendChild(rssiSpan);
                                 infoRow.appendChild(timeSpan);
-                                
+
                                 if (device.filter) {
                                     const filterSpan = document.createElement('span');
                                     filterSpan.className = 'device-filter';
@@ -2385,6 +2536,116 @@ DD:EE:FF:ab:cd:ef
                     });
             }
             
+            // Mode 1's persisted schema stores match_method as a long-form
+            // label ("oui_prefix" / "full_mac" / etc). The badge palette is
+            // keyed off the short codes the standalone firmware uses; map
+            // between the two so both live and previous rows render.
+            function mapMatchMethod(mm) {
+                if (!mm) return null;
+                var s = String(mm).toLowerCase();
+                if (s.indexOf('oui') >= 0) return 'OUI';
+                if (s.indexOf('full_mac') >= 0 || s === 'mac') return 'MAC';
+                if (s.indexOf('company') >= 0 || s === 'cid') return 'CID';
+                if (s.indexOf('service') >= 0 || s === 'svc') return 'SVC';
+                if (s.indexOf('name') >= 0) return 'NAME';
+                var allowed = ['OUI','MAC','CID','SVC','NAME'];
+                var up = String(mm).toUpperCase();
+                return allowed.indexOf(up) >= 0 ? up : null;
+            }
+
+            function makeMatchBadge(type, description, matchIdent) {
+                var badge = document.createElement('span');
+                var t = mapMatchMethod(type) || 'OUI';
+                badge.className = 'match-badge type-' + t;
+                badge.textContent = t;
+                var titleParts = [];
+                if (matchIdent) titleParts.push(matchIdent);
+                if (description) titleParts.push(description);
+                badge.title = titleParts.join(' - ');
+                return badge;
+            }
+
+            function togglePrevSession() {
+                var list = document.getElementById('previousSessionList');
+                var caret = document.getElementById('previousSessionCaret');
+                if (!list) return;
+                if (list.style.display === 'none') {
+                    list.style.display = '';
+                    caret.textContent = '[-]';
+                } else {
+                    list.style.display = 'none';
+                    caret.textContent = '[+]';
+                }
+            }
+
+            function loadPreviousSession() {
+                fetch('/api/session/previous')
+                    .then(function(r) { return r.json(); })
+                    .then(function(arr) {
+                        var panel = document.getElementById('previousSessionPanel');
+                        var list  = document.getElementById('previousSessionList');
+                        var title = document.getElementById('previousSessionTitle');
+                        if (!Array.isArray(arr) || arr.length === 0) {
+                            if (panel) panel.style.display = 'none';
+                            return;
+                        }
+                        panel.style.display = '';
+                        title.textContent = 'PREVIOUS SESSION (' + arr.length + ')';
+                        list.innerHTML = '';
+                        arr.forEach(function(entry) {
+                            var item = document.createElement('div');
+                            item.className = 'device-item';
+                            var row = document.createElement('div');
+                            row.className = 'device-info-row';
+
+                            var macSpan = document.createElement('span');
+                            macSpan.className = 'device-mac';
+                            macSpan.textContent = entry.mac_address || entry.mac || '?';
+                            row.appendChild(macSpan);
+
+                            var mm = entry.match_method || entry.type;
+                            var sig = entry.matched_signature || entry.desc || '';
+                            row.appendChild(makeMatchBadge(mm, sig, entry.matched_signature || entry.match));
+
+                            var rssi = (typeof entry.rssi_max === 'number') ? entry.rssi_max
+                                     : (typeof entry.rssi === 'number' ? entry.rssi : null);
+                            if (rssi !== null) {
+                                var rs = document.createElement('span');
+                                rs.className = 'device-rssi';
+                                rs.textContent = rssi + ' dBm';
+                                row.appendChild(rs);
+                            }
+
+                            var prevTag = document.createElement('span');
+                            prevTag.className = 'prev-tag';
+                            prevTag.textContent = 'PREV';
+                            row.appendChild(prevTag);
+
+                            if (sig) {
+                                var descSpan = document.createElement('span');
+                                descSpan.className = 'device-filter';
+                                descSpan.textContent = sig;
+                                descSpan.title = sig;
+                                row.appendChild(descSpan);
+                            }
+                            item.appendChild(row);
+                            list.appendChild(item);
+                        });
+                    })
+                    .catch(function(err) {
+                        console.error('prev session load failed', err);
+                    });
+            }
+
+            function clearPreviousSession() {
+                fetch('/api/session/clear_previous', { method: 'POST' })
+                    .then(function() {
+                        var panel = document.getElementById('previousSessionPanel');
+                        if (panel) panel.style.display = 'none';
+                    })
+                    .catch(function(err) { console.error(err); });
+            }
+
             function saveAlias(mac, alias, button) {
                 const originalText = button.textContent;
                 const originalBg = button.style.background;
@@ -3040,6 +3301,8 @@ void startConfigMode() {
             json += "\"mac\":\"" + devices[i].macAddress + "\",";
             json += "\"rssi\":" + String(devices[i].rssi) + ",";
             json += "\"filter\":\"" + filterDesc + "\",";
+            json += "\"type\":\"" + String(filterTypeCode(devices[i].matchedType)) + "\",";
+            json += "\"match\":\"" + devices[i].matchedIdentifier + "\",";
             json += "\"alias\":\"" + alias + "\",";
             json += "\"lastSeen\":" + String(devices[i].lastSeen) + ",";
             json += "\"timeSince\":" + String(timeSince);
@@ -3512,6 +3775,15 @@ class MyAdvertisedDeviceCallbacks: public NimBLEAdvertisedDeviceCallbacks {
                 newDev.cooldownUntil = 0;
                 newDev.matchedFilter = matchedDescription.c_str();
                 newDev.filterDescription = matchedDescription;
+                // Second pass to recover the specific filter class + raw
+                // identifier for the dashboard match-type badge. Fills a
+                // sane default if the resolver can't reproduce the hit.
+                FilterType mt = FT_MAC_PREFIX;
+                String mid;
+                if (resolveMatchedFilterMeta(advertisedDevice, mac, mt, mid)) {
+                    newDev.matchedType = mt;
+                    newDev.matchedIdentifier = mid;
+                }
                 devices.push_back(newDev);
 
                 // Store data for main loop to process
