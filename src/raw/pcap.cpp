@@ -624,9 +624,17 @@ void write_frame_text(const capture::Frame& f) {
 // ---------------------------------------------------------------------------
 namespace session_pcap {
 
-constexpr size_t DESIRED_CAP    = 2 * 1024 * 1024;
-constexpr size_t FALLBACK_CAP   = 64 * 1024;
+// Tiered PSRAM allocation. First entry that succeeds wins; nothing falls
+// through to DRAM (that path OOM-crashed the ESP32 previously).
+constexpr size_t CAP_TIERS[] = { 6 * 1024 * 1024, 4 * 1024 * 1024, 2 * 1024 * 1024 };
 constexpr size_t GLOBAL_HDR_LEN = 24;
+
+enum class State : uint8_t {
+    IDLE      = 0,
+    RECORDING = 1,
+    PAUSED    = 2,
+    STOPPED   = 3
+};
 
 struct __attribute__((packed)) PcapGlobal {
     uint32_t magic;
@@ -648,9 +656,8 @@ size_t            g_used    = 0;
 uint32_t          g_dropped = 0;
 SemaphoreHandle_t g_lock    = nullptr;
 
-uint8_t*          g_snap      = nullptr;
-size_t            g_snap_cap  = 0;
-size_t            g_snap_size = 0;
+volatile State    g_state       = State::IDLE;
+volatile uint32_t g_downloads   = 0;
 
 void write_global_header_locked() {
     PcapGlobal g{};
@@ -679,36 +686,89 @@ size_t next_boundary_after_locked(size_t bytes_to_drop) {
     return o;
 }
 
+void reset_ring_locked() {
+    write_global_header_locked();
+    g_dropped = 0;
+}
+
 bool init() {
     if (g_buf) return true;
     g_lock = xSemaphoreCreateMutex();
     if (!g_lock) return false;
 
-    g_buf = (uint8_t*) heap_caps_malloc(DESIRED_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-    if (g_buf) {
-        g_cap = DESIRED_CAP;
-    } else {
-        g_buf = (uint8_t*) malloc(FALLBACK_CAP);
-        if (!g_buf) { vSemaphoreDelete(g_lock); g_lock = nullptr; return false; }
-        g_cap = FALLBACK_CAP;
+    for (size_t i = 0; i < sizeof(CAP_TIERS) / sizeof(CAP_TIERS[0]); ++i) {
+        uint8_t* p = (uint8_t*)heap_caps_malloc(CAP_TIERS[i],
+                                                MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (p) {
+            g_buf = p;
+            g_cap = CAP_TIERS[i];
+            Serial.printf("[session_pcap] tier %u ok: %u bytes in PSRAM\n",
+                          (unsigned)i, (unsigned)g_cap);
+            break;
+        }
+        Serial.printf("[session_pcap] tier %u FAILED (%u bytes)\n",
+                      (unsigned)i, (unsigned)CAP_TIERS[i]);
     }
+
+    if (!g_buf) {
+        Serial.println("[session_pcap] disabled -- no PSRAM tier available");
+        vSemaphoreDelete(g_lock);
+        g_lock = nullptr;
+        return false;
+    }
+
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    write_global_header_locked();
-    g_dropped = 0;
+    reset_ring_locked();
+    g_state = State::IDLE;
     xSemaphoreGive(g_lock);
     return true;
 }
 
-void clear() {
-    if (!g_buf) return;
+State       state()      { return g_state; }
+const char* state_name() {
+    switch (g_state) {
+        case State::IDLE:      return "idle";
+        case State::RECORDING: return "recording";
+        case State::PAUSED:    return "paused";
+        case State::STOPPED:   return "stopped";
+    }
+    return "?";
+}
+
+bool cmd_record() {
+    if (!g_buf || !g_lock) return false;
+    if (g_state == State::RECORDING) return false;
     xSemaphoreTake(g_lock, portMAX_DELAY);
-    write_global_header_locked();
-    g_dropped = 0;
+    reset_ring_locked();
+    g_state = State::RECORDING;
     xSemaphoreGive(g_lock);
+    return true;
+}
+
+bool cmd_pause() {
+    if (!g_buf || !g_lock) return false;
+    if (g_state != State::RECORDING) return false;
+    g_state = State::PAUSED;
+    return true;
+}
+
+bool cmd_resume() {
+    if (!g_buf || !g_lock) return false;
+    if (g_state != State::PAUSED) return false;
+    g_state = State::RECORDING;
+    return true;
+}
+
+bool cmd_stop() {
+    if (!g_buf || !g_lock) return false;
+    if (g_state != State::RECORDING && g_state != State::PAUSED) return false;
+    g_state = State::STOPPED;
+    return true;
 }
 
 void append(const capture::Frame& f) {
     if (!g_buf || !g_lock) return;
+    if (g_state != State::RECORDING) return;
 
     uint8_t rt[capture::RADIOTAP_LEN];
     capture::build_radiotap(rt, f.channel, f.rssi, f.rate_500k);
@@ -718,6 +778,12 @@ void append(const capture::Frame& f) {
     if (rec_len > g_cap - GLOBAL_HDR_LEN) return;
 
     xSemaphoreTake(g_lock, portMAX_DELAY);
+
+    // Re-check state after taking the lock -- a stop() could have raced in.
+    if (g_state != State::RECORDING) {
+        xSemaphoreGive(g_lock);
+        return;
+    }
 
     if (g_used + rec_len > g_cap) {
         // Reclaim at least half the buffer per memmove to amortize the cost.
@@ -752,9 +818,10 @@ uint32_t dropped()   { return g_dropped; }
 
 size_t read_chunk(size_t offset, uint8_t* out, size_t len) {
     if (!g_buf || !g_lock) return 0;
+    if (g_state != State::STOPPED) return 0;
     xSemaphoreTake(g_lock, portMAX_DELAY);
     size_t copied = 0;
-    if (offset < g_used) {
+    if (g_state == State::STOPPED && offset < g_used) {
         const size_t remain = g_used - offset;
         const size_t n = (len < remain) ? len : remain;
         memcpy(out, g_buf + offset, n);
@@ -764,31 +831,9 @@ size_t read_chunk(size_t offset, uint8_t* out, size_t len) {
     return copied;
 }
 
-size_t snapshot_take() {
-    if (!g_buf || !g_lock) return 0;
-    xSemaphoreTake(g_lock, portMAX_DELAY);
-    const size_t sz = g_used;
-    if (sz == 0) { xSemaphoreGive(g_lock); g_snap_size = 0; return 0; }
-    if (!g_snap || g_snap_cap < sz) {
-        if (g_snap) heap_caps_free(g_snap);
-        g_snap = (uint8_t*) heap_caps_malloc(sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (!g_snap) g_snap = (uint8_t*) malloc(sz);
-        if (!g_snap) { g_snap_cap = 0; g_snap_size = 0; xSemaphoreGive(g_lock); return 0; }
-        g_snap_cap = sz;
-    }
-    memcpy(g_snap, g_buf, sz);
-    g_snap_size = sz;
-    xSemaphoreGive(g_lock);
-    return sz;
-}
-size_t snapshot_size() { return g_snap_size; }
-size_t snapshot_read(size_t offset, uint8_t* out, size_t len) {
-    if (!g_snap || offset >= g_snap_size) return 0;
-    const size_t remain = g_snap_size - offset;
-    const size_t n = (len < remain) ? len : remain;
-    memcpy(out, g_snap + offset, n);
-    return n;
-}
+void download_begin() { g_downloads++; }
+void download_end()   { if (g_downloads) g_downloads--; }
+uint32_t downloads_in_flight() { return g_downloads; }
 
 } // namespace session_pcap
 
@@ -1159,6 +1204,114 @@ static const char PCAP_INDEX_HTML[] PROGMEM = R"HTML(<meta charset="utf-8">
   #save-status.ok { color: var(--good); }
   #save-status.err { color: var(--bad); }
 
+  /* -- session control strip ---------------------------------------- */
+  .sess {
+    display: grid;
+    grid-template-columns: auto 1fr auto;
+    gap: 14px;
+    align-items: center;
+    padding: 8px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    min-width: 0;
+  }
+  .sess .info { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+  .sess .badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 4px 10px;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px; font-weight: 700; letter-spacing: 2px;
+    text-transform: uppercase;
+    border: 1px solid;
+    background: rgba(255,255,255,0.02);
+    white-space: nowrap;
+  }
+  .sess .badge .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    display: inline-block; background: currentColor;
+  }
+  .sess .badge.idle      { color: #8892a0; border-color: #4a5568; }
+  .sess .badge.recording {
+    color: #ff2b3b; border-color: #ff2b3b;
+    background: rgba(255,43,59,0.10);
+    animation: pulse-rec 1.2s ease-in-out infinite;
+    box-shadow: 0 0 12px rgba(255,43,59,0.35);
+  }
+  .sess .badge.paused    {
+    color: #f6c05a; border-color: #f6c05a;
+    background: rgba(246,192,90,0.10);
+  }
+  .sess .badge.stopped   {
+    color: #4ecca3; border-color: #4ecca3;
+    background: rgba(78,204,163,0.10);
+    box-shadow: 0 0 10px rgba(78,204,163,0.35);
+  }
+  @keyframes pulse-rec {
+    0%   { opacity: 0.6; }
+    50%  { opacity: 1.0; }
+    100% { opacity: 0.6; }
+  }
+
+  .sess .bar-wrap { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+  .sess .bar {
+    height: 10px; width: 100%;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    position: relative; overflow: hidden;
+  }
+  .sess .bar .fill {
+    height: 100%;
+    width: 0%;
+    background: #4a5568;
+    transition: width 200ms ease, background 120ms ease;
+    box-shadow: none;
+  }
+  .sess.state-recording .bar .fill { background: #ff2b3b; box-shadow: 0 0 10px rgba(255,43,59,0.55); }
+  .sess.state-paused    .bar .fill { background: #f6c05a; }
+  .sess.state-stopped   .bar .fill { background: #4ecca3; box-shadow: 0 0 10px rgba(78,204,163,0.45); }
+  .sess.state-idle      .bar .fill { background: #4a5568; }
+  .sess .readout {
+    display: flex; gap: 14px; align-items: center;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px; color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .sess .readout .fill-txt { color: var(--text); }
+  .sess .readout .drops    { color: var(--warn); }
+  .sess .readout .drops.zero { color: var(--muted); }
+  .sess .readout .mem      { color: var(--dim); }
+
+  .sess .btns { display: flex; gap: 6px; flex-wrap: wrap; }
+  .sess .sbtn {
+    padding: 7px 12px;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 12px; font-weight: 600; letter-spacing: 1px;
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    cursor: pointer;
+    text-transform: uppercase;
+    white-space: nowrap;
+    transition: color 100ms ease, border-color 100ms ease, background 100ms ease;
+  }
+  .sess .sbtn:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  .sess .sbtn:disabled {
+    opacity: 0.35; cursor: not-allowed;
+  }
+  .sess .sbtn.rec         { color: #ff2b3b; border-color: #ff2b3b; }
+  .sess .sbtn.rec:hover:not(:disabled)   { background: rgba(255,43,59,0.10); color: #ff2b3b; }
+  .sess .sbtn.pause       { color: #f6c05a; border-color: #f6c05a; }
+  .sess .sbtn.pause:hover:not(:disabled) { background: rgba(246,192,90,0.10); color: #f6c05a; }
+  .sess .sbtn.stop        { color: #d5dee8; border-color: #7d8896; }
+  .sess .sbtn.stop:hover:not(:disabled)  { background: rgba(213,222,232,0.06); color: #fff; border-color: #d5dee8; }
+  .sess .sbtn.save        { color: #4ecca3; border-color: #4ecca3; }
+  .sess .sbtn.save:hover:not(:disabled)  { background: rgba(78,204,163,0.10); color: #4ecca3; }
+
+  @media (max-width: 720px) {
+    .sess { grid-template-columns: 1fr; }
+    .sess .btns { justify-content: flex-start; }
+  }
+
   @media (max-width: 900px) {
     .app { grid-template-columns: 240px 1fr; }
     .banner { font-size: 6px; }
@@ -1312,6 +1465,25 @@ static const char PCAP_INDEX_HTML[] PROGMEM = R"HTML(<meta charset="utf-8">
   </aside>
 
   <div class="main">
+    <div class="sess state-idle" id="sess">
+      <div class="info">
+        <span class="badge idle" id="sessBadge"><span class="dot"></span><span id="sessBadgeTxt">IDLE</span></span>
+      </div>
+      <div class="bar-wrap">
+        <div class="bar"><div class="fill" id="sessFill"></div></div>
+        <div class="readout">
+          <span class="fill-txt"><b id="sessBytesTxt">0 B</b> / <b id="sessCapTxt">--</b> &mdash; <b id="sessPct">0%</b></span>
+          <span class="drops zero">dropped: <b id="sessDrop">0</b></span>
+          <span class="mem">psram <b id="sessPsram">--</b> &middot; heap <b id="sessHeap">--</b></span>
+        </div>
+      </div>
+      <div class="btns">
+        <button class="sbtn rec"   id="btnRecord" title="Start recording">&#9679; RECORD</button>
+        <button class="sbtn pause" id="btnPause"  title="Pause recording">&#9208; PAUSE</button>
+        <button class="sbtn stop"  id="btnStop"   title="Stop and finalize">&#9209; STOP</button>
+        <button class="sbtn save"  id="btnSavePcap" title="Download session PCAP">&#8681; SAVE PCAP</button>
+      </div>
+    </div>
     <div class="toolbar">
       <input type="text" id="filter" placeholder="filter -- rssi>-60 | src:aa:bb | ssid:xfini | free text" />
       <button class="btn settings" id="btnSettings">Settings</button>
@@ -1319,8 +1491,6 @@ static const char PCAP_INDEX_HTML[] PROGMEM = R"HTML(<meta charset="utf-8">
       <button class="btn active" id="pauseBtn">Running</button>
       <button class="btn" id="clearViewBtn">Clear</button>
       <button class="btn" id="snapBtn">CSV</button>
-      <button class="btn active" id="savePcapBtn">Save PCAP</button>
-      <button class="btn danger" id="clearSessionBtn">Clear session</button>
       <button class="btn danger" id="clearRingBtn">Clear ring</button>
     </div>
 
@@ -1677,7 +1847,83 @@ static const char PCAP_INDEX_HTML[] PROGMEM = R"HTML(<meta charset="utf-8">
   $('clearRingBtn').onclick = async () => {
     try { await fetch('/api/clear', {method:'POST'}); } catch(e){}
   };
-  $('savePcapBtn').onclick = () => {
+
+  // --- Session state machine (Record / Pause / Stop / Save) -----------
+  function fmtBytes(n) {
+    if (n == null) return '--';
+    if (n < 1024) return n + ' B';
+    if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+    if (n < 1024*1024*1024) return (n/(1024*1024)).toFixed(1) + ' MB';
+    return (n/(1024*1024*1024)).toFixed(2) + ' GB';
+  }
+  let sessState = 'idle';
+  let sessCap   = 0;
+  function pretty(state) {
+    if (state === 'recording') return 'RECORDING';
+    if (state === 'paused')    return 'PAUSED';
+    if (state === 'stopped')   return 'STOPPED';
+    return 'IDLE';
+  }
+  function applySessState(state) {
+    const s = state || 'idle';
+    sessState = s;
+    const sess = $('sess');
+    sess.classList.remove('state-idle','state-recording','state-paused','state-stopped');
+    sess.classList.add('state-' + s);
+    const badge = $('sessBadge');
+    badge.classList.remove('idle','recording','paused','stopped');
+    badge.classList.add(s);
+    $('sessBadgeTxt').textContent = pretty(s);
+
+    const rec   = $('btnRecord');
+    const pause = $('btnPause');
+    const stop  = $('btnStop');
+    const save  = $('btnSavePcap');
+    if (s === 'idle') {
+      rec.innerHTML   = '&#9679; RECORD';
+      rec.disabled    = false;
+      pause.disabled  = true;
+      stop.disabled   = true;
+      save.disabled   = true;
+    } else if (s === 'recording') {
+      rec.innerHTML   = '&#9679; RECORD';
+      rec.disabled    = true;
+      pause.disabled  = false;
+      stop.disabled   = false;
+      save.disabled   = true;
+    } else if (s === 'paused') {
+      rec.innerHTML   = '&#9654; RESUME';
+      rec.disabled    = false;
+      pause.disabled  = true;
+      stop.disabled   = false;
+      save.disabled   = true;
+    } else if (s === 'stopped') {
+      rec.innerHTML   = '&#9679; RE-RECORD';
+      rec.disabled    = false;
+      pause.disabled  = true;
+      stop.disabled   = true;
+      save.disabled   = false;
+    }
+  }
+  applySessState('idle');
+
+  async function sessPost(path) {
+    try { await fetch(path, {method:'POST'}); } catch(e){}
+  }
+  $('btnRecord').onclick = () => {
+    applySessState('recording');
+    sessPost('/api/session/record');
+  };
+  $('btnPause').onclick = () => {
+    applySessState('paused');
+    sessPost('/api/session/pause');
+  };
+  $('btnStop').onclick = () => {
+    applySessState('stopped');
+    sessPost('/api/session/stop');
+  };
+  $('btnSavePcap').onclick = () => {
+    if (sessState !== 'stopped') return;
     const stamp = new Date().toISOString().replace(/[:.]/g,'-').slice(0,19);
     const a = document.createElement('a');
     a.href = '/api/session.pcap?ts=' + Date.now();
@@ -1685,10 +1931,6 @@ static const char PCAP_INDEX_HTML[] PROGMEM = R"HTML(<meta charset="utf-8">
     document.body.appendChild(a);
     a.click();
     a.remove();
-  };
-  $('clearSessionBtn').onclick = async () => {
-    if (!confirm('Discard the recorded session PCAP?')) return;
-    try { await fetch('/api/session/clear', {method:'POST'}); } catch(e){}
   };
   $('snapBtn').onclick = () => {
     const cols = ['idx','t_ms','ch','rssi','type','src','dst','bssid','len','info'];
@@ -1872,6 +2114,20 @@ static const char PCAP_INDEX_HTML[] PROGMEM = R"HTML(<meta charset="utf-8">
         $('statDrop').className = 'v' + (drop > 0 ? ' bad' : '');
         $('totalPkts').textContent = msg.total || 0;
         $('fwVer').textContent = msg.fw || '--';
+
+        applySessState(msg.state || 'idle');
+        sessCap = msg.session_cap || 0;
+        const sbytes = msg.session_bytes || 0;
+        $('sessBytesTxt').textContent = fmtBytes(sbytes);
+        $('sessCapTxt').textContent   = sessCap ? fmtBytes(sessCap) : '--';
+        const pct = sessCap ? Math.min(100, (sbytes * 100 / sessCap)) : 0;
+        $('sessPct').textContent = pct.toFixed(pct < 10 ? 1 : 0) + '%';
+        $('sessFill').style.width = pct.toFixed(2) + '%';
+        const sd = msg.session_drop || 0;
+        $('sessDrop').textContent = sd;
+        $('sessDrop').parentElement.classList.toggle('zero', sd === 0);
+        if (msg.psram_free != null) $('sessPsram').textContent = fmtBytes(msg.psram_free);
+        if (msg.heap_free  != null) $('sessHeap').textContent  = fmtBytes(msg.heap_free);
         return;
       }
       if (msg.type === 'pkts' && Array.isArray(msg.p)) {
@@ -2024,13 +2280,19 @@ size_t append_pkt_json(const capture::Frame& f, char* out, size_t cap) {
 
 void send_status() {
     if (ws.count() == 0) return;
-    StaticJsonDocument<384> doc;
+    StaticJsonDocument<640> doc;
     doc["type"] = "status";
     doc["uptime"] = (uint32_t)((millis() - boot_ms) / 1000);
     doc["pps"]    = capture::packets_per_sec();
     doc["total"]  = capture::total_packets();
     doc["dropped_pcap"] = capture::dropped_pcap();
     doc["dropped_dash"] = capture::dropped_dash();
+    doc["session_bytes"] = (uint32_t)session_pcap::size();
+    doc["session_cap"]   = (uint32_t)session_pcap::capacity();
+    doc["session_drop"]  = (uint32_t)session_pcap::dropped();
+    doc["state"]         = session_pcap::state_name();
+    doc["psram_free"]    = (uint32_t)ESP.getFreePsram();
+    doc["heap_free"]     = (uint32_t)ESP.getFreeHeap();
     doc["fw"] = config::FW_VERSION();
 
     if (config::get().mode == config::MODE_LOCKED) {
@@ -2044,7 +2306,7 @@ void send_status() {
         doc["chan_str"] = cbuf;
     }
 
-    char buf[400];
+    char buf[640];
     size_t n = serializeJson(doc, buf, sizeof(buf));
     ws.textAll(buf, n);
 }
@@ -2210,20 +2472,77 @@ void handle_clear(AsyncWebServerRequest* req) {
     req->send(200, "application/json", "{\"ok\":true}");
 }
 
-void handle_session_clear(AsyncWebServerRequest* req) {
-    session_pcap::clear();
-    req->send(200, "application/json", "{\"ok\":true}");
+// -- Session state machine endpoints -----------------------------------------
+// Legal transitions:
+//   IDLE|PAUSED|STOPPED -> RECORDING   (via /api/session/record; clears ring)
+//   RECORDING           -> PAUSED      (via /api/session/pause)
+//   PAUSED              -> RECORDING   (via /api/session/resume)
+//   RECORDING|PAUSED    -> STOPPED     (via /api/session/stop)
+// Illegal transitions return HTTP 409 with the current + attempted state.
+
+const char* target_name_for(const char* which) {
+    if (!strcmp(which, "record") || !strcmp(which, "resume")) return "recording";
+    if (!strcmp(which, "pause"))  return "paused";
+    if (!strcmp(which, "stop"))   return "stopped";
+    return "?";
+}
+
+void reply_transition(AsyncWebServerRequest* req, bool ok, const char* which, const char* from) {
+    if (ok) {
+        char body[80];
+        snprintf(body, sizeof(body), "{\"ok\":true,\"state\":\"%s\"}",
+                 session_pcap::state_name());
+        req->send(200, "application/json", body);
+    } else {
+        char body[160];
+        snprintf(body, sizeof(body),
+                 "{\"error\":\"invalid transition\",\"from\":\"%s\",\"to\":\"%s\"}",
+                 from, target_name_for(which));
+        req->send(409, "application/json", body);
+    }
+}
+
+void handle_session_record(AsyncWebServerRequest* req) {
+    const char* from = session_pcap::state_name();
+    reply_transition(req, session_pcap::cmd_record(), "record", from);
+}
+void handle_session_pause(AsyncWebServerRequest* req) {
+    const char* from = session_pcap::state_name();
+    reply_transition(req, session_pcap::cmd_pause(),  "pause",  from);
+}
+void handle_session_resume(AsyncWebServerRequest* req) {
+    const char* from = session_pcap::state_name();
+    reply_transition(req, session_pcap::cmd_resume(), "resume", from);
+}
+void handle_session_stop(AsyncWebServerRequest* req) {
+    const char* from = session_pcap::state_name();
+    reply_transition(req, session_pcap::cmd_stop(),   "stop",   from);
 }
 
 void handle_session_pcap(AsyncWebServerRequest* req) {
-    // Snapshot the live ring so the download can't desync mid-transfer.
-    const size_t total = session_pcap::snapshot_take();
-    if (total == 0) { req->send(204, "application/vnd.tcpdump.pcap", ""); return; }
+    // Download only permitted from STOPPED. Chunks are read straight from the
+    // live ring under the session mutex -- the STOPPED guarantee is what makes
+    // this safe. No snapshot buffer. If state leaves STOPPED mid-download
+    // (Record wipes the ring) read_chunk() returns 0 and the response truncates.
+    if (session_pcap::state() != session_pcap::State::STOPPED) {
+        req->send(409, "application/json",
+            "{\"error\":\"invalid transition\",\"detail\":\"download only allowed from stopped\"}");
+        return;
+    }
+    if (session_pcap::size() <= session_pcap::GLOBAL_HDR_LEN) {
+        req->send(204, "application/vnd.tcpdump.pcap", "");
+        return;
+    }
 
+    session_pcap::download_begin();
     AsyncWebServerResponse* r = req->beginChunkedResponse(
         "application/vnd.tcpdump.pcap",
         [](uint8_t* buf, size_t maxLen, size_t index) -> size_t {
-            return session_pcap::snapshot_read(index, buf, maxLen);
+            constexpr size_t CHUNK = 4096;
+            size_t want = maxLen < CHUNK ? maxLen : CHUNK;
+            size_t got = session_pcap::read_chunk(index, buf, want);
+            if (got == 0) session_pcap::download_end();
+            return got;
         });
     char filename[64];
     snprintf(filename, sizeof(filename), "attachment; filename=\"ouispy-pcap-%lu.pcap\"",
@@ -2248,8 +2567,11 @@ bool init() {
     server.on("/api/reboot",       HTTP_POST, handle_reboot);
     server.on("/api/reset",        HTTP_POST, handle_reset);
     server.on("/api/clear",        HTTP_POST, handle_clear);
-    server.on("/api/session.pcap", HTTP_GET,  handle_session_pcap);
-    server.on("/api/session/clear",HTTP_POST, handle_session_clear);
+    server.on("/api/session.pcap",   HTTP_GET,  handle_session_pcap);
+    server.on("/api/session/record", HTTP_POST, handle_session_record);
+    server.on("/api/session/pause",  HTTP_POST, handle_session_pause);
+    server.on("/api/session/resume", HTTP_POST, handle_session_resume);
+    server.on("/api/session/stop",   HTTP_POST, handle_session_stop);
 
     server.onNotFound([](AsyncWebServerRequest* req){ req->send(404, "text/plain", "not found"); });
 
