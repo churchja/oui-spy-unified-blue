@@ -32,5 +32,12 @@ namespace {
 #undef setup
 #undef loop
 
-void skyspy_setup() { skyspy_ns_setup(); }
+void skyspy_setup() {
+    // Mode 5 has NO AP (WIFI_STA + promiscuous for Remote-ID capture), but
+    // still touches the radio, so we run the same preamble.
+    ouispy_mode_preamble("MODE 5 SKY SPY");
+    skyspy_ns_setup();
+    ouispy_log_ap_state("MODE 5 SKY SPY", /*expectAP=*/false);
+}
 void skyspy_loop()  { skyspy_ns_loop(); }
+void skyspy_stop()  { /* Stage 1: stop BLE scan + WiFi action-frame capture */ }

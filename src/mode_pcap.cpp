@@ -43,7 +43,11 @@ namespace {
 #undef setup
 #undef loop
 
-void pcap_setup() { pcap_ns_setup(); }
+void pcap_setup() {
+    ouispy_mode_preamble("MODE 4 PCAP");
+    pcap_ns_setup();
+    ouispy_log_ap_state("MODE 4 PCAP", /*expectAP=*/true);
+}
 void pcap_loop()  { pcap_ns_loop(); }
 void pcap_stop() {
     // main.cpp reboots back to the selector on BOOT hold, so this only runs

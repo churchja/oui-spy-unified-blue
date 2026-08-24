@@ -45,7 +45,11 @@ namespace {
 #undef setup
 #undef loop
 
-void blesniff_setup() { blesniff_ns_setup(); }
+void blesniff_setup() {
+    ouispy_mode_preamble("MODE 6 BLESNIFF");
+    blesniff_ns_setup();
+    ouispy_log_ap_state("MODE 6 BLESNIFF", /*expectAP=*/true);
+}
 void blesniff_loop()  { blesniff_ns_loop(); }
 void blesniff_stop() {
     // main.cpp reboots back to the selector on BOOT hold, so this only runs

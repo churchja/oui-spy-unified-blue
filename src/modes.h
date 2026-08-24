@@ -1,6 +1,17 @@
 #ifndef MODES_H
 #define MODES_H
 
+// Shared preamble used by every mode's exported setup() to reset the radio
+// state (WiFi.persistent(false) + WIFI_OFF + esp_wifi_restore). Prevents the
+// Arduino WiFi wrapper from writing per-mode SSIDs back to ESP32-native NVS,
+// which is the root cause of "wrong SSID after switching modes" bugs.
+void ouispy_mode_preamble(const char* modeName);
+
+// Log the actual softAP state after a mode's setup runs. If expectAP is true
+// and no AP came up, starts a fallback "oui-spy-recovery" AP so the board is
+// still reachable. Returns true if an AP is live at the end of the call.
+bool ouispy_log_ap_state(const char* modeName, bool expectAP);
+
 // Mode 1: OUI Spy Detector
 void detector_setup();
 void detector_loop();
