@@ -40,20 +40,30 @@ boxes. Company ID, 16-bit service UUID, and device-name substring cannot be
 expressed as text and are installed from the OUI Database.
 
 **OUI Database.** A browsable list of known surveillance hardware — RING,
-AXON, FLOCK SAFETY, DJI, PARROT, SKYDIO, META/RAYBAN — each with prefixes,
-category, and typical devices. AXON and META/RAYBAN carry more than OUIs, so
-their button reads **+ Add all signatures**:
+AXON, FLOCK SAFETY, DJI, PARROT, SKYDIO — each with prefixes, category, and
+typical devices. AXON carries more than OUIs, so its button reads **+ Add
+all signatures**:
 
 | Vendor | Signatures |
 |---|---|
 | **AXON** | OUI `00:25:DF`, company ID `0x034D` (TASER International), service UUID `0xFC81` |
-| **META/RAYBAN** | 5 OUIs, company ID `0x0D53` (Luxottica), service UUID `0xFD5F`, names `Ray-Ban` / `Wayfarer` / `Oakley Meta` |
 
-OUIs alone are the weakest signal for both — Meta glasses rotate their MAC,
-and Axon hardware may never expose its OUI in an advertisement. The Luxottica
-company ID is also what separates Ray-Ban glasses from Quest headsets, which
-share Meta's own IDs. Each added vendor renders one colour-coded line under
-the OUI box with an `x` to remove. Manual OUI entry is unaffected.
+OUIs alone are the weakest signal — Axon hardware may never expose its OUI
+in an advertisement, so the company ID and service UUID do most of the work.
+Each added vendor renders one colour-coded line under the OUI box with an
+`x` to remove. Manual OUI entry is unaffected.
+
+**Meta / Ray-Ban detection.** No OUI-Database preset. The glasses use RPA
+(rotating random MAC per BT spec), so OUI-based matching is pure noise, and
+CID-only or svc-UUID-only auto-installers were false-positive magnets.
+Detection is instead handled by a hardcoded composite matcher that runs on
+every advert regardless of user filter config and fires only when either:
+mfr company ID `0x0D53` (Luxottica) AND service UUID `0xFD5F` (Meta) are
+present in the same advert, or the complete local name contains `Ray-Ban`,
+`Wayfarer`, or `Oakley Meta`. Hits render with a red-pink `META` badge and
+are logged with `match_method: "meta_composite"`. Manually adding `0x0D53`,
+`0xFD5F`, or a Luxottica MAC via the target config UI still triggers via the
+normal filter path with its normal badge.
 
 **Burn-in is reversible.** Locking the config disables the AP permanently, but
 holding BOOT during power-on clears the lock and restores config mode. Older
