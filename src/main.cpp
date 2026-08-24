@@ -141,12 +141,12 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 <div class="h"><div class="ti">OUI SPY</div><div class="s">FIRMWARE SELECTOR</div></div>
 <div id="x">
 <div class="m">
-<div class="i" onclick="go(1)"><div class="n">DETECTOR</div><div class="d">BLE Alert Tool for Specific Devices</div></div>
-<div class="i" onclick="go(2)"><div class="n">FOXHUNTER</div><div class="d">RSSI Proximity Tracker</div></div>
-<div class="i" onclick="go(3)"><div class="n">FLOCK-YOU WIFI</div><div class="d">Promiscuous Mode &bull; @NitekryDPaul / OrdoOuroborous</div></div>
-<div class="i" onclick="go(4)"><div class="n">PCAP</div><div class="d">Passive WiFi Capture &bull; Wireshark-ready over USB-CDC + web dashboard</div></div>
-<div class="i" onclick="go(5)"><div class="n">SKY SPY</div><div class="d">Drone Remote ID Monitor</div></div>
-<div class="i" onclick="go(6)"><div class="n">BLE SNIFF</div><div class="d">Passive BLE Adverts &bull; Wireshark-ready over USB-CDC + web dashboard</div></div>
+<div class="i" onclick="go(1)"><div class="n">DETECTOR</div><div class="d">AP: snoopuntothem &bull; BLE alert tool</div></div>
+<div class="i" onclick="go(2)"><div class="n">FOXHUNTER</div><div class="d">AP: foxhunter &bull; RSSI proximity tracker</div></div>
+<div class="i" onclick="go(3)"><div class="n">FLOCK-YOU WIFI</div><div class="d">No AP &bull; Promiscuous 2.4 GHz sniffer + USB-CDC</div></div>
+<div class="i" onclick="go(4)"><div class="n">PCAP</div><div class="d">AP: ouispy-pcap &bull; Passive WiFi capture + USB-CDC</div></div>
+<div class="i" onclick="go(5)"><div class="n">SKY SPY</div><div class="d">No AP &bull; Drone Remote ID monitor</div></div>
+<div class="i" onclick="go(6)"><div class="n">BLE SNIFF</div><div class="d">AP: ouispy-blesniff &bull; Passive BLE adverts + USB-CDC</div></div>
 </div>
 <div class="ap">
 <input type="text" id="ap_ssid" placeholder="SSID" maxlength="32" value="%SSID%">
@@ -155,6 +155,7 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 <label class="bz"><input type="checkbox" id="bz" onchange="saveBZ(this.checked)" %BUZZER%>BZR</label>
 </div>
 <div class="f" id="ft">Hold BOOT 1.5s for menu &bull; MAC randomized</div>
+<div class="f"><button onclick="wipeAll()" style="background:#300;color:#f66;border:1px solid #f66;font-family:monospace;font-size:10px;padding:4px 10px;cursor:pointer;letter-spacing:1px">WIPE ALL SETTINGS AND REBOOT</button></div>
 </div>
 <div id="y" class="boot" style="display:none">
 <div class="bt" id="yt"></div>
@@ -163,7 +164,7 @@ body{margin:0;height:100vh;height:-webkit-fill-available;font-family:monospace;b
 </div>
 </div>
 <script>
-var info={1:{t:'DETECTOR',s:'Scans for BLE devices and alerts when specific targets are detected. Configure OUI prefixes and MAC addresses to monitor.'},2:{t:'FOXHUNTER',s:'Track down a specific device using RSSI signal strength. Beeps get faster as you get closer to your target.'},3:{t:'FLOCK-YOU WIFI',s:'Passive 2.4 GHz promiscuous-mode detector for Flock Safety. Matches addr1/addr2 OUIs and the DeFlockJoplin wildcard-probe signature. Streams Flask-compatible JSON over USB and persists to SPIFFS; pull history via the CMD:DUMP_PREV protocol. No AP.'},4:{t:'PCAP',s:'Passive WiFi packet capture. Wireshark-ready PCAP over USB-CDC, live web dashboard at http://192.168.4.1, channel hop across the full 2.4 GHz band, in-PSRAM session PCAP for browser download.'},5:{t:'SKY SPY',s:'Monitors for FAA Remote ID broadcasts from drones. Detects Open Drone ID signals over WiFi and BLE.'},6:{t:'BLE SNIFF',s:'Passive BLE advertising capture (channels 37/38/39). Wireshark-ready PCAP (linktype 256) over USB-CDC + live dashboard on ouispy-blesniff, 2 MB in-PSRAM session PCAP for browser download.'}};
+var info={1:{t:'DETECTOR',s:'AP: snoopuntothem / astheysnoopuntous. Scans for BLE devices and alerts when specific targets are detected. Configure OUI prefixes and MAC addresses to monitor.'},2:{t:'FOXHUNTER',s:'AP: foxhunter / foxhunter. Track down a specific device using RSSI signal strength. Beeps get faster as you get closer to your target.'},3:{t:'FLOCK-YOU WIFI',s:'No AP - USB-CDC only. Passive 2.4 GHz promiscuous-mode detector for Flock Safety. Matches addr1/addr2 OUIs and the DeFlockJoplin wildcard-probe signature. Streams Flask-compatible JSON over USB and persists to SPIFFS; pull history via the CMD:DUMP_PREV protocol.'},4:{t:'PCAP',s:'AP: ouispy-pcap / packetsniffer. Passive WiFi packet capture. Wireshark-ready PCAP over USB-CDC, live web dashboard at http://192.168.4.1, channel hop across the full 2.4 GHz band, in-PSRAM session PCAP for browser download.'},5:{t:'SKY SPY',s:'No AP - serial JSON out. Monitors for FAA Remote ID broadcasts from drones. Detects Open Drone ID signals over WiFi and BLE.'},6:{t:'BLE SNIFF',s:'AP: ouispy-blesniff / sniffuntothem. Passive BLE advertising capture (channels 37/38/39). Wireshark-ready PCAP (linktype 256) over USB-CDC + live dashboard, 2 MB in-PSRAM session PCAP for browser download.'}};
 function go(m){var d=info[m];document.getElementById('yt').textContent=d.t;document.getElementById('ys').textContent=d.s;document.getElementById('x').style.display='none';document.getElementById('y').style.display='flex';fetch('/select?mode='+m)}
 function saveAP(){
 var s=document.getElementById('ap_ssid').value.trim();
@@ -176,6 +177,7 @@ fetch('/saveap?ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(p)).then
 if(r.ok){ft.textContent='SAVED! REBOOTING...'}else{ft.textContent='ERROR'}
 }).catch(function(){ft.textContent='ERROR'})}
 function saveBZ(on){fetch('/buzzer?on='+(on?'1':'0'))}
+function wipeAll(){if(!confirm('WIPE all NVS (mode config, AP SSID/pass, per-mode preferences) and reboot?'))return;var ft=document.getElementById('ft');ft.textContent='WIPING NVS...';fetch('/nuke_nvs').then(function(r){if(r.ok){ft.textContent='WIPED. REBOOTING...'}else{ft.textContent='WIPE FAILED'}}).catch(function(){ft.textContent='WIPE FAILED'})}
 </script></body></html>
 )rawliteral";
 
@@ -390,6 +392,53 @@ static void startSelector() {
         }
     });
     
+    // Nuke ALL NVS (recovery button in selector footer). Also wipes the
+    // ESP32-native auto-restore WiFi slot before rebooting so nothing stale
+    // can come back up next boot.
+    selectorServer.on("/nuke_nvs", HTTP_GET, [](AsyncWebServerRequest *request) {
+        Serial.println("[OUI-SPY] *** NUKE NVS REQUESTED ***");
+        Serial.flush();
+        WiFi.persistent(false);
+        WiFi.softAPdisconnect(true);
+        WiFi.disconnect(true, true);
+        WiFi.mode(WIFI_OFF);
+        delay(100);
+        esp_wifi_restore();      // Erase ESP32-native WiFi auto-restore slot
+        nvs_flash_erase();       // Wipe every NVS namespace on this partition
+        nvs_flash_init();
+        request->send(200, "text/plain", "OK - rebooting");
+        Serial.println("[OUI-SPY] NVS erased. Rebooting.");
+        Serial.flush();
+        delay(800);
+        ESP.restart();
+    });
+
+    // Reset one mode's per-mode NVS namespace to defaults, so a bogus stored
+    // AP SSID for that mode reverts to the compiled-in default on next boot.
+    // GET /reset_mode?m=1..6
+    selectorServer.on("/reset_mode", HTTP_GET, [](AsyncWebServerRequest *request) {
+        if (!request->hasParam("m")) {
+            request->send(400, "text/plain", "missing m");
+            return;
+        }
+        int m = request->getParam("m")->value().toInt();
+        Preferences p;
+        bool ok = false;
+        switch (m) {
+            case 1: ok = p.begin("ouispy", false); if (ok) { p.remove("ap_ssid"); p.remove("ap_pass"); p.end(); } break;
+            case 2: /* foxhunter has no NVS-configurable AP SSID */ ok = true; break;
+            case 3: /* mode 3 has no AP */ ok = true; break;
+            case 4: ok = p.begin("pcap-mode", false); if (ok) { p.remove("apssid"); p.remove("appass"); p.end(); } break;
+            case 5: /* mode 5 has no AP */ ok = true; break;
+            case 6: ok = p.begin("blesniff", false); if (ok) { p.remove("ap_ssid"); p.remove("ap_pass"); p.end(); } break;
+            default:
+                request->send(400, "text/plain", "m must be 1-6");
+                return;
+        }
+        Serial.printf("[OUI-SPY] /reset_mode m=%d ok=%d\n", m, ok ? 1 : 0);
+        request->send(200, "text/plain", ok ? "OK" : "namespace open failed");
+    });
+
     // Reset to selector (callable from any mode's web interface)
     selectorServer.on("/menu", HTTP_GET, [](AsyncWebServerRequest *request) {
         prefs.begin("unified-mode", false);
@@ -452,7 +501,13 @@ void setup() {
     // CRITICAL: Nuke ALL stored WiFi config from NVS.
     // The ESP32 persists AP SSID/password in flash and auto-restores it,
     // causing stale APs from previous firmware to appear on every boot.
-    // We must: init WiFi -> restore factory defaults -> shut it down.
+    // We must: pin persistent=false -> init WiFi -> restore factory defaults
+    // -> shut it down. WiFi.persistent(false) is critical: without it, any
+    // subsequent WiFi.softAP() call would overwrite the auto-restore slot,
+    // and next boot the wrong SSID would come back up before the mode's own
+    // setup ran. Every mode's setup() also re-asserts persistent(false) via
+    // ouispy_mode_preamble().
+    WiFi.persistent(false);
     WiFi.mode(WIFI_AP_STA);       // Init the WiFi stack so IDF calls work
     delay(100);
     esp_wifi_restore();           // Erase ALL stored WiFi config from NVS

@@ -41,6 +41,13 @@ namespace {
 #undef setup
 #undef loop
 
-void flockyou_promiscious_setup() { flockyou_promiscious_ns_setup(); }
+void flockyou_promiscious_setup() {
+    // Mode 3 has NO AP (promiscuous only), but still touches the radio.
+    // The preamble matters so a prior mode's leftover softAP state can't
+    // reappear on this boot.
+    ouispy_mode_preamble("MODE 3 FLOCK-YOU");
+    flockyou_promiscious_ns_setup();
+    ouispy_log_ap_state("MODE 3 FLOCK-YOU", /*expectAP=*/false);
+}
 void flockyou_promiscious_loop()  { flockyou_promiscious_ns_loop(); }
 void flockyou_promiscious_stop()  { /* Stage 1: disable promiscuous cb, flush SPIFFS session */ }

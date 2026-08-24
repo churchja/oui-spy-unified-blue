@@ -38,5 +38,22 @@ namespace {
 #undef loop
 
 // Exported mode entry points (called from main.cpp)
-void detector_setup() { detector_ns_setup(); }
+void detector_setup() {
+    ouispy_mode_preamble("MODE 1 DETECTOR");
+    detector_ns_setup();
+    ouispy_log_ap_state("MODE 1 DETECTOR", /*expectAP=*/true);
+}
 void detector_loop()  { detector_ns_loop(); }
+void detector_stop() {
+    // The mode's globals live in this file's anonymous namespace, so they are
+    // reachable unqualified here. Stop mode-specific resources; the manager's
+    // releaseRadios() then deinits NimBLE and powers WiFi down after we return.
+    if (pBLEScan) {
+        pBLEScan->stop();
+        pBLEScan->clearResults();
+    }
+    detectorDNS.stop();
+    server.end();
+    strip.clear();
+    strip.show();
+}

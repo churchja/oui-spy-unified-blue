@@ -28,5 +28,10 @@ namespace {
 #undef setup
 #undef loop
 
-void foxhunter_setup() { foxhunter_ns_setup(); }
+void foxhunter_setup() {
+    ouispy_mode_preamble("MODE 2 FOXHUNTER");
+    foxhunter_ns_setup();
+    ouispy_log_ap_state("MODE 2 FOXHUNTER", /*expectAP=*/true);
+}
 void foxhunter_loop()  { foxhunter_ns_loop(); }
+void foxhunter_stop()  { /* Stage 1: end web server, stop BLE scan, silence buzzer */ }
