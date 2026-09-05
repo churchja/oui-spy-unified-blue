@@ -5,6 +5,7 @@
 #include <string.h>
 #include <SPIFFS.h>
 #include <Preferences.h>
+#include <TinyGPSPlus.h>
 #include "display_dongle.h"
 
 // ============================================================
@@ -247,6 +248,12 @@ typedef struct {
   uint32_t lastSeen;       // millis() at latest hit
   uint16_t count;
   char     ssid[33];       // "" unless an SSID hit populated it
+  // Hardware GPS, stamped at detection time. Scalars only -- the table is
+  // memcpy/serialised wholesale, so nothing here may own heap.
+  double   gpsLat;
+  double   gpsLon;
+  float    gpsAcc;         // metres, derived from HDOP
+  bool     hasGPS;         // false => no fix was fresh when this MAC was seen
 } FYDetection;
 
 static FYDetection fyDet[MAX_DETECTIONS];
@@ -254,6 +261,41 @@ static int           fyDetCount       = 0;
 static bool          fySpiffsReady    = false;
 static bool          fyDirty          = false;
 static unsigned long fyLastSaveAt     = 0;
+
+// ============================================================
+// HARDWARE GPS  (Seeed L76K GNSS, NMEA over UART)
+// ============================================================
+//
+// This mode runs WIFI_MODE_NULL + promiscuous and retunes the radio every
+// CHANNEL_DWELL_MS to follow cameras that themselves hop. A softAP pins the
+// radio to one channel, so the phone-GPS path the BLE edition used cannot
+// exist here -- coordinates have to come from a separate UART.
+//
+// UART2, RX-ONLY, on purpose. MIRROR_SERIAL already owns UART1 *and* GPIO43
+// (see setup()), so the reference implementation's HardwareSerial(1) on
+// GPIO43/44 would collide on both the peripheral and the pin. The L76K only
+// ever talks, so passing TX=-1 leaves GPIO43 with its existing owner.
+//
+// Single-threaded by construction: only loop() calls into any of this, the
+// same rule the detection table above documents. No mutex, and none of the
+// reference's snapshot machinery -- that existed only because a web server
+// task read the fix concurrently, and there is no web server in this mode.
+#define GPS_UART_NUM      2
+#define GPS_RX_PIN        44      // D7 -- ESP32 RX <- module TX
+#define GPS_BAUD          9600
+#define GPS_HDOP_SCALE    5.0f    // HDOP * scale ~= accuracy in metres
+#define GPS_STALE_MS      30000   // a fix older than this is not stamped
+#define GPS_HW_TIMEOUT_MS 5000    // no NMEA for this long => module absent
+
+static HardwareSerial fyGPSSerial(GPS_UART_NUM);
+static TinyGPSPlus    fyGPS;
+static bool           fyGPSPresent    = false;   // NMEA seen recently
+static bool           fyGPSValid      = false;   // a position has been decoded
+static double         fyGPSLat        = 0.0;
+static double         fyGPSLon        = 0.0;
+static float          fyGPSAcc        = 0.0f;
+static uint32_t       fyGPSLastFixAt  = 0;
+static uint32_t       fyGPSLastCharAt = 0;
 static int           fyLastSaveCount  = 0;
 
 // ============================================================
@@ -342,7 +384,7 @@ typedef struct __attribute__((packed)) {
 // ============================================================
 
 // Dual-output: prints to both Serial (USB) and Serial1 (GPIO43)
-static char _dualBuf[384];
+static char _dualBuf[512];
 
 static void dualPrintf(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void dualPrintf(const char* fmt, ...) {
@@ -632,6 +674,60 @@ static const char* alertTypeToMethod(AlertType t) {
 // the ascending new-discovery chirp. Chirp-worthy means either (a) MAC is
 // brand new to this session, or (b) MAC is known but hasn't been seen in
 // REDISCOVER_MS — i.e. it left RF range and came back.
+// Drain the UART into the parser. Non-blocking: at 9600 baud roughly one byte
+// per millisecond arrives, so each loop() pass moves a handful. updateChannelMode()
+// gates on an absolute millis() test rather than accumulated time, so this cannot
+// skew the channel dwell.
+static void fyProcessGPS() {
+  while (fyGPSSerial.available()) {
+    fyGPS.encode((char)fyGPSSerial.read());
+    fyGPSLastCharAt = millis();
+    if (!fyGPSPresent) {
+      fyGPSPresent = true;
+      dualPrintln("[flockyou] GPS module detected (NMEA received)");
+    }
+  }
+
+  // Absence is normal, not an error: with nothing wired the module simply
+  // never appears and every detection is stamped hasGPS=false.
+  if (fyGPSPresent && (millis() - fyGPSLastCharAt > GPS_HW_TIMEOUT_MS)) {
+    fyGPSPresent = false;
+    fyGPSValid   = false;
+    dualPrintln("[flockyou] GPS module gone (no NMEA for 5s)");
+  }
+
+  if (fyGPS.location.isUpdated() && fyGPS.location.isValid()) {
+    bool first = !fyGPSValid;
+    fyGPSLat = fyGPS.location.lat();
+    fyGPSLon = fyGPS.location.lng();
+    // HDOP is a unitless geometry factor, not metres. Scaling it is a rough
+    // stand-in for accuracy; 10m is the fallback when the module omits HDOP.
+    fyGPSAcc = fyGPS.hdop.isValid()
+             ? (float)(fyGPS.hdop.hdop() * GPS_HDOP_SCALE) : 10.0f;
+    fyGPSValid     = true;
+    fyGPSLastFixAt = millis();
+    if (first) {
+      dualPrintf("[flockyou] first GPS fix: %.6f,%.6f acc=%.1fm sats=%u\n",
+                 fyGPSLat, fyGPSLon, fyGPSAcc,
+                 (unsigned)(fyGPS.satellites.isValid() ? fyGPS.satellites.value() : 0));
+    }
+  }
+}
+
+// A held fix goes stale if the module stops reporting; stamping a 10-minute-old
+// position onto a detection would put the pin in the wrong place on the map.
+static inline bool fyGPSIsFresh() {
+  return fyGPSValid && (millis() - fyGPSLastFixAt < GPS_STALE_MS);
+}
+
+static void fyAttachGPS(FYDetection& d) {
+  if (!fyGPSIsFresh()) return;
+  d.hasGPS = true;
+  d.gpsLat = fyGPSLat;
+  d.gpsLon = fyGPSLon;
+  d.gpsAcc = fyGPSAcc;
+}
+
 static int fyAddDetection(const char* mac, const char* method, uint8_t tier,
                           int8_t rssi, uint8_t ch, const char* ssid,
                           bool* outChirpWorthy) {
@@ -643,6 +739,9 @@ static int fyAddDetection(const char* mac, const char* method, uint8_t tier,
       fyDet[i].lastSeen = now;
       fyDet[i].rssi     = rssi;
       fyDet[i].channel  = ch;
+      // Re-stamp on every sighting: a MAC seen again a mile later should carry
+      // where it was seen LAST, matching lastSeen/rssi/channel above.
+      fyAttachGPS(fyDet[i]);
       // Method/tier are best-ever, not last-seen: a MAC first caught by a
       // broad addr1 echo and later confirmed by the IE fingerprint should
       // read as the fingerprint from then on. Previously method[] was
@@ -677,6 +776,11 @@ static int fyAddDetection(const char* mac, const char* method, uint8_t tier,
   d.count     = 1;
   if (ssid && ssid[0]) strlcpy(d.ssid, ssid, sizeof(d.ssid));
   else                 d.ssid[0] = '\0';
+  d.hasGPS = false;
+  d.gpsLat = 0.0;
+  d.gpsLon = 0.0;
+  d.gpsAcc = 0.0f;
+  fyAttachGPS(d);
   fyDetCount++;
   fyDirty = true;
   if (outChirpWorthy) *outChirpWorthy = true;
@@ -744,17 +848,28 @@ static uint32_t fyCRC32Update(uint32_t crc, const uint8_t* data, size_t len) {
 static size_t fySerializeDet(const FYDetection& d, char* dst, size_t cap) {
   char ssidEsc[sizeof(d.ssid) * 6 + 1];
   jsonEscape(ssidEsc, sizeof(ssidEsc), d.ssid);
+  // Emitted only when a fix was fresh, so with no module wired the output is
+  // byte-identical to before this field existed -- old session files stay
+  // readable and the CRC of an unchanged table is unchanged.
+  char gps[72];
+  if (d.hasGPS) {
+    snprintf(gps, sizeof(gps),
+             ",\"gps\":{\"lat\":%.8f,\"lon\":%.8f,\"acc\":%.1f}",
+             d.gpsLat, d.gpsLon, (double)d.gpsAcc);
+  } else {
+    gps[0] = '\0';
+  }
   int n = snprintf(dst, cap,
       "{\"mac\":\"%s\",\"method\":\"%s\",\"tier\":%u,\"rssi\":%d,\"channel\":%u,"
-      "\"first\":%lu,\"last\":%lu,\"count\":%u,\"ssid\":\"%s\"}",
+      "\"first\":%lu,\"last\":%lu,\"count\":%u,\"ssid\":\"%s\"%s}",
       d.mac, d.method, (unsigned)d.tier, d.rssi, (unsigned)d.channel,
       (unsigned long)d.firstSeen, (unsigned long)d.lastSeen, (unsigned)d.count,
-      ssidEsc);
+      ssidEsc, gps);
   return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
 }
 
 static uint32_t fyComputePayloadCRC(size_t& outBytes) {
-  char line[384];
+  char line[512];
   uint32_t crc = 0;
   outBytes = 0;
   crc = fyCRC32Update(crc, (const uint8_t*)"[", 1); outBytes += 1;
@@ -857,7 +972,7 @@ static void fySaveSession() {
   f.printf("{\"v\":1,\"count\":%d,\"bytes\":%u,\"crc\":\"0x%08lX\"}\n",
            savedCount, (unsigned)payloadBytes, (unsigned long)crc);
 
-  char line[384];
+  char line[512];
   size_t wrote = 0;
   f.write((uint8_t*)"[", 1); wrote++;
   for (int i = 0; i < fyDetCount; i++) {
@@ -933,8 +1048,13 @@ static void fyPromotePrevSession() {
 // and extracts these fields:  mac_address, rssi, channel, frequency, ssid,
 // device_name, gps.latitude, gps.longitude, gps.accuracy.
 //
-// GPS is handled Flask-side via its own USB NMEA puck or browser geolocation;
-// we don't embed GPS here because there's no on-device AP / phone link.
+// GPS was originally handled Flask-side via its own USB NMEA puck, because
+// there is no on-device AP for a phone to reach. With an L76K on UART2 the
+// device now has its own fix, so it embeds one when it has one. Flask keeps
+// working either way: the object is omitted entirely when there is no fix,
+// which is what the host already assumed. Note the key names here are
+// latitude/longitude/accuracy -- what api/flockyou.py parses -- and NOT the
+// shorter lat/lon/acc that fySerializeDet writes into session.json.
 
 static void emitDetectionJSON(const char* mac, const char* method, uint8_t tier,
                               int8_t rssi, uint8_t ch, const char* ssid) {
@@ -945,6 +1065,15 @@ static void emitDetectionJSON(const char* mac, const char* method, uint8_t tier,
   sscanf(mac, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
          &mbytes[0], &mbytes[1], &mbytes[2], &mbytes[3], &mbytes[4], &mbytes[5]);
   ouiFromMac(mbytes, oui, sizeof(oui));
+
+  char gps[96];
+  if (fyGPSIsFresh()) {
+    snprintf(gps, sizeof(gps),
+             ",\"gps\":{\"latitude\":%.8f,\"longitude\":%.8f,\"accuracy\":%.1f}",
+             fyGPSLat, fyGPSLon, (double)fyGPSAcc);
+  } else {
+    gps[0] = '\0';
+  }
 
   dualPrintf(
       "{\"event\":\"detection\","
@@ -957,9 +1086,9 @@ static void emitDetectionJSON(const char* mac, const char* method, uint8_t tier,
       "\"rssi\":%d,"
       "\"channel\":%u,"
       "\"frequency\":%u,"
-      "\"ssid\":\"%s\"}\n",
+      "\"ssid\":\"%s\"%s}\n",
       method, (unsigned)tier, mac, oui, rssi,
-      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc);
+      (unsigned)ch, (unsigned)channelFreqMhz(ch), ssidEsc, gps);
 }
 
 // ============================================================
@@ -1621,6 +1750,12 @@ void setup() {
   Serial1.begin(MIRROR_BAUD, SERIAL_8N1, -1, MIRROR_TX_PIN);  // TX-only on GPIO43
 #endif
 
+  // UART2 and RX-only: the mirror above holds UART1 and GPIO43, and the L76K
+  // never needs to be spoken to. TX=-1 means no second pin is claimed.
+  fyGPSSerial.begin(GPS_BAUD, SERIAL_8N1, GPS_RX_PIN, -1);
+  dualPrintf("[flockyou] GPS: UART%u RX=GPIO%u @%u (L76K auto-detect)\n",
+             (unsigned)GPS_UART_NUM, (unsigned)GPS_RX_PIN, (unsigned)GPS_BAUD);
+
 #if USE_BUZZER
   pinMode(BUZZER_PIN, OUTPUT);
   digitalWrite(BUZZER_PIN, LOW);
@@ -1697,6 +1832,7 @@ void setup() {
 void loop() {
   updateChannelMode();
   pollHostCommands();  // dashboard → device (per-tier beep mute)
+  fyProcessGPS();      // drain NMEA before the table is written below
   drainAlertQueue();   // Serial.printf happens here, not in callback
   autosaveTick();      // periodic SPIFFS write if dirty
   heartbeatTick();     // audible beep-pair while a target is still in range

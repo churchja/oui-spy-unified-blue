@@ -27,6 +27,7 @@
 #include <string.h>
 #include <SPIFFS.h>
 #include <Preferences.h>
+#include <TinyGPSPlus.h>   // hardware GPS; must be outside the namespace
 #include "modes.h"
 
 // Rename setup/loop so they don't collide with the unified main.cpp's
