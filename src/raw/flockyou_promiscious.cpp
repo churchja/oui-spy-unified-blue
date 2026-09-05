@@ -681,10 +681,21 @@ static const char* alertTypeToMethod(AlertType t) {
 static void fyProcessGPS() {
   while (fyGPSSerial.available()) {
     fyGPS.encode((char)fyGPSSerial.read());
-    fyGPSLastCharAt = millis();
+  }
+
+  // Presence means a CHECKSUM-VALID sentence, never merely "bytes arrived".
+  // GPIO44 is the S3's UART0 RX and floats when nothing is wired; on the first
+  // boot after this patch it picked up enough noise to announce a module that
+  // was not there, then time out 5s later, and would have flapped forever.
+  // A passing NMEA checksum cannot be produced by line noise.
+  static uint32_t lastGoodSentences = 0;
+  uint32_t good = fyGPS.passedChecksum();
+  if (good != lastGoodSentences) {
+    lastGoodSentences = good;
+    fyGPSLastCharAt  = millis();
     if (!fyGPSPresent) {
       fyGPSPresent = true;
-      dualPrintln("[flockyou] GPS module detected (NMEA received)");
+      dualPrintln("[flockyou] GPS module detected (valid NMEA)");
     }
   }
 
